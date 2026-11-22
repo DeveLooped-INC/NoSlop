@@ -1,0 +1,301 @@
+// FILE: app/src/main/java/com/noslop/app/mesh/PostPacketHandler.kt
+package com.noslop.app.mesh
+
+import com.noslop.app.data.*
+import android.util.Base64
+import com.noslop.app.crypto.CryptoService
+import com.noslop.app.debug.Logger
+
+/**
+ * Handles incoming POST mesh packets (handlePost, handleEditPost, handleDeletePost).
+ *
+ * Extracted from the monolithic MeshPacketHandler (Phase 0, Stage 0.3) into one handler per packet
+ * domain behind a dispatcher. Constructed with (repo, db) like the original; method bodies are a
+ * verbatim move (ADR-004). The dispatcher routes by packet type; this class owns the per-type logic.
+ */
+class PostPacketHandler(
+    private val repo: NoSlopRepository,
+    private val db: NoSlopDatabase
+) {
+    private val TAG = "MESH_HANDLER"
+    private val postDao = db.postDao()
+    private val peerDao = db.peerDao()
+
+    companion object {
+        /**
+         * D08: the metadata handed to auto-download. Its `sha256` is the digest the download is checked
+         * against, so it is kept only when the post's signature covers it (the C17 v2 encoding). With
+         * only the 8-field signature, a relay could attach the digest of its own substituted file.
+         */
+        internal fun downloadMetadata(metadata: MediaMetadata, digestIsSigned: Boolean): MediaMetadata =
+            if (digestIsSigned || metadata.sha256 == null) metadata else metadata.copy(sha256 = null)
+
+        /**
+         * P1-D: `origin_node` (and `mediaMetadata.origin_node`) are not covered by the post signature, so
+         * any relay could point the media download of someone else's post at a host of its choosing. A
+         * claimed origin is used only if it is the onion derived from the author's key (every NoSlop
+         * sender sets its own identity's onion; nothing sets a third-party host). Returns the first such
+         * claim, or null so callers fall back to the author's stored peer onion.
+         */
+        internal fun verifiedOriginOnion(authorId: String, vararg claimed: String?): String? =
+            claimed.firstOrNull { !it.isNullOrBlank() && CryptoService.isOnionOf(authorId, it) }
+
+        /** Test hook: replaces MediaManager.checkAndAutoDownload so a test can read what was requested. */
+        @Volatile
+        internal var autoDownloadForTesting: (suspend (MediaMetadata, String, String, String?) -> Unit)? = null
+    }
+
+    private suspend fun autoDownload(metadata: MediaMetadata, context: String, authorId: String, peerOnion: String?) {
+        autoDownloadForTesting?.let { return it(metadata, context, authorId, peerOnion) }
+        MediaManager.checkAndAutoDownload(metadata, context, authorId, peerOnion)
+    }
+
+    suspend fun handlePost(packet: NetworkPacket): Boolean {
+        val postPay = packet.getPostPayload() ?: return false
+        val filterSettings = try { repo.getMeshFilterSettings() ?: MeshFilterSettings() } catch (e: Exception) { MeshFilterSettings() }
+        if (postPay.clearnetUrl != null && !filterSettings.allowIncomingClearnetShares) {
+            Logger.info(TAG, "PostHandler: Mesh Filter dropped incoming clearnet share post ${postPay.id}")
+            return false
+        }
+        if (postPay.mediaMetadata != null) {
+            if (postPay.mediaMetadata.type == "image" && !filterSettings.allowIncomingImagePosts) return false
+            if (postPay.mediaMetadata.type == "video" && !filterSettings.allowIncomingVideoPosts) return false
+        } else if (postPay.clearnetUrl == null) {
+            if (!filterSettings.allowIncomingTextPosts) return false
+        }
+
+        val mediaHash = postPay.mediaMetadata?.sha256
+        val payloadCanonicalV2 = if (mediaHash != null) {
+            com.noslop.app.crypto.CryptoService.encodeForSigning(
+                postPay.id, postPay.authorId, postPay.content, postPay.timestamp.toString(), postPay.authorAvatarB64,
+                postPay.privacy, postPay.mediaId, postPay.clearnetUrl, mediaHash
+            )
+        } else null
+        val payloadCanonical = com.noslop.app.crypto.CryptoService.encodeForSigning(
+            postPay.id, postPay.authorId, postPay.content, postPay.timestamp.toString(), postPay.authorAvatarB64,
+            postPay.privacy, postPay.mediaId, postPay.clearnetUrl
+        )
+        val sig = postPay.signature ?: ""
+        // R05: Enforce strict mediaId == mediaMetadata.id consistency
+        if (postPay.mediaMetadata != null && postPay.mediaId != postPay.mediaMetadata.id) {
+            Logger.warn(TAG, "Rejected POST ${postPay.id}: mediaMetadata.id does not match mediaId")
+            return false
+        }
+        if (postPay.mediaId != null && postPay.mediaMetadata == null) {
+            Logger.warn(TAG, "Rejected POST ${postPay.id}: mediaId present without mediaMetadata")
+            return false
+        }
+
+        val isV2 = payloadCanonicalV2 != null && CryptoService.verify(payloadCanonicalV2, sig, postPay.authorId)
+        val isCanonical = isV2 || CryptoService.verify(payloadCanonical, sig, postPay.authorId)
+        if (!isCanonical) {
+            Logger.warn(TAG, "Rejected POST ${postPay.id}: Canonical 8-field signature verification failed")
+            return false
+        }
+
+        val pubBytes = Base64.decode(postPay.authorId, Base64.DEFAULT)
+        val tripcode = CryptoService.deriveTripcode(pubBytes)
+        val peer = peerDao.getPeerByPublicKey(postPay.authorId)
+        val handle = peer?.handle ?: postPay.authorName
+
+        // Robustness: Sniff media type from URL if it's missing in the packet
+        var effectiveClearnetType = postPay.clearnetMediaType
+        if (effectiveClearnetType == null && postPay.clearnetUrl != null) {
+            val url = postPay.clearnetUrl.lowercase()
+            if (url.contains("youtube.com") || url.contains("youtu.be") || 
+                url.contains("vimeo.com") || url.contains("archive.org/embed")) {
+                effectiveClearnetType = "video"
+            }
+        }
+
+        // P1-D: an unsigned origin is honoured only when it is the author's own onion.
+        val originOnion = verifiedOriginOnion(postPay.authorId, postPay.originNode, postPay.mediaMetadata?.originNode)
+        if (originOnion == null && (!postPay.originNode.isNullOrBlank() || !postPay.mediaMetadata?.originNode.isNullOrBlank())) {
+            Logger.warn(TAG, "POST ${postPay.id}: origin_node is not the author's onion; ignored")
+        }
+        val resolvedOnion = originOnion ?: peer?.onionAddress ?: packet.senderId
+        val meshPost = MeshPost(
+            id = postPay.id,
+            authorPublicKeyB64 = postPay.authorId,
+            authorHandle = handle,
+            authorTripcode = tripcode,
+            authorAvatarB64 = postPay.authorAvatarB64,
+            content = postPay.content,
+            timestamp = postPay.timestamp,
+            signature = postPay.signature ?: "",
+            mediaUrl = postPay.mediaId?.let { "noslop://$resolvedOnion/$it" },
+            mediaType = postPay.mediaMetadata?.type,
+            gossipCount = 1,
+            privacy = postPay.privacy,
+            thumbnailB64 = postPay.mediaMetadata?.thumbnailB64,
+            clearnetUrl = postPay.clearnetUrl,
+            clearnetTitle = postPay.clearnetTitle,
+            clearnetThumbnailUrl = postPay.clearnetThumbnailUrl,
+            clearnetMediaType = effectiveClearnetType,
+            isOrphaned = false,
+            mediaSize = postPay.mediaMetadata?.size ?: 0L
+        )
+        // R07: Transactional and atomic post insertion
+        val inserted = postDao.insertPostSafely(meshPost, signedMediaHash = if (isV2) mediaHash else null)
+        if (!inserted) {
+            Logger.debug(TAG, "Dropping POST ${postPay.id}: post exists with newer timestamp, is orphaned, or author mismatch")
+            return true
+        }
+        // R2: keep the signed digest so this post can be re-served through sync with its v2 signature.
+        if (isV2) repo.recordMediaDigest(postPay.mediaId, mediaHash)
+
+        // New Broadcast Notifications
+        val myKeys = repo.getLocalIdentity()
+        val burnableKeys = repo.getBurnableIdentity()
+        val isFromSelf = postPay.authorId == myKeys?.publicKeyB64 ||
+                         (burnableKeys != null && postPay.authorId == burnableKeys.publicKeyB64)
+
+        if (!isFromSelf && !meshPost.isOrphaned) {
+            try {
+                val notifSettings = repo.notificationSettingsFlow.value
+                if (notifSettings.broadcasts) {
+                    val notifTitle = com.noslop.app.util.LanguageManager.translate("New Broadcast")
+                    val authorDisplay = handle.ifBlank { "A peer" }
+                    val notifBody = postPay.clearnetTitle?.takeIf { it.isNotBlank() }
+                        ?: postPay.content.takeIf { it.isNotBlank() }
+                        ?: com.noslop.app.util.LanguageManager.translate("{author} shared a new broadcast.").replace("{author}", authorDisplay)
+                    val targetRoute = "post/${meshPost.id}"
+
+                    db.notificationDao().insertNotification(
+                        NotificationItem(
+                            id = "broadcast_${meshPost.id}",
+                            type = "POST",
+                            title = "$authorDisplay: $notifTitle",
+                            body = notifBody.take(120),
+                            targetRoute = targetRoute,
+                            iconType = "broadcast",
+                            senderPub = postPay.authorId,
+                            timestamp = postPay.timestamp
+                        )
+                    )
+
+                    com.noslop.app.util.NotificationHelper.showNotification(
+                        context = repo.context,
+                        title = "$authorDisplay: $notifTitle",
+                        message = notifBody.take(120),
+                        deepLinkRoute = targetRoute,
+                        notificationId = meshPost.id.hashCode()
+                    )
+                }
+            } catch (e: Throwable) {
+                Logger.debug(TAG, "Notification dispatch skipped: ${e.message}")
+            }
+        }
+        
+        if (postPay.mediaMetadata != null) {
+            val peerOnion = originOnion ?: peer?.onionAddress
+            Logger.info(TAG, "Requesting auto-download for POST media ${postPay.mediaMetadata.id} from ${peerOnion ?: "unknown"}")
+            if (!isV2 && mediaHash != null) {
+                Logger.warn(TAG, "POST ${postPay.id}: media digest not covered by the signature; downloading unverified")
+            }
+            autoDownload(
+                // P1-D: MediaManager falls back to metadata.originNode, so the unverified one is not passed on.
+                downloadMetadata(postPay.mediaMetadata, isV2).copy(originNode = peerOnion),
+                "friends",
+                postPay.authorId,
+                peerOnion
+            )
+        } else {
+            Logger.debug(TAG, "No mediaMetadata found in post ${postPay.id}")
+        }
+
+        Logger.info(TAG, "Valid signed post accepted and stored: handle=${handle}.${tripcode}")
+        return true
+    }
+
+    suspend fun handleEditPost(packet: NetworkPacket): Boolean {
+        val editPay = packet.getEditPostPayload() ?: return false
+        if (editPay.mediaMetadata != null && editPay.mediaId != editPay.mediaMetadata.id) {
+            Logger.warn(TAG, "Rejected EDIT_POST ${editPay.postId}: mediaMetadata.id does not match mediaId")
+            return false
+        }
+
+        val effectivePrivacy = editPay.privacy ?: "public"
+        val mediaHash = editPay.mediaMetadata?.sha256
+        val payloadCanonicalV2 = if (mediaHash != null) {
+            com.noslop.app.crypto.CryptoService.encodeForSigning(
+                editPay.postId, editPay.authorId, editPay.content, editPay.timestamp.toString(), editPay.authorAvatarB64,
+                effectivePrivacy, editPay.mediaId, editPay.clearnetUrl, mediaHash
+            )
+        } else null
+        val payloadCanonical = com.noslop.app.crypto.CryptoService.encodeForSigning(
+            editPay.postId, editPay.authorId, editPay.content, editPay.timestamp.toString(), editPay.authorAvatarB64,
+            effectivePrivacy, editPay.mediaId, editPay.clearnetUrl
+        )
+        val isV2 = payloadCanonicalV2 != null && CryptoService.verify(payloadCanonicalV2, editPay.signature, editPay.authorId)
+        val isCanonical = isV2 || CryptoService.verify(payloadCanonical, editPay.signature, editPay.authorId)
+        if (!isCanonical) {
+            Logger.warn(TAG, "Rejected EDIT_POST ${editPay.postId}: Canonical 8-field signature verification failed")
+            return false
+        }
+
+        val existingPost = postDao.getPostById(editPay.postId)
+        if (existingPost != null) {
+            val peer = peerDao.getPeerByPublicKey(editPay.authorId)
+            val originOnion = verifiedOriginOnion(editPay.authorId, editPay.mediaMetadata?.originNode)
+            val resolvedOnion = originOnion ?: peer?.onionAddress ?: packet.senderId
+            // S08/U06: Retain existing descriptor when media is retained without replacement
+            val newMediaUrl = editPay.mediaId?.let { "noslop://$resolvedOnion/$it" }
+            val newMediaType = if (editPay.mediaId != null) (editPay.mediaMetadata?.type ?: existingPost.mediaType) else null
+            val newThumb = if (editPay.mediaId != null) (editPay.mediaMetadata?.thumbnailB64 ?: existingPost.thumbnailB64) else null
+            val newSize = if (editPay.mediaId != null) (editPay.mediaMetadata?.size ?: existingPost.mediaSize) else 0L
+
+            val success = postDao.editPostSafely(
+                id = editPay.postId,
+                authorId = editPay.authorId,
+                newContent = editPay.content,
+                newTimestamp = editPay.timestamp,
+                newSignature = editPay.signature,
+                authorAvatarB64 = editPay.authorAvatarB64,
+                mediaUrl = newMediaUrl,
+                mediaType = newMediaType,
+                thumbnailB64 = newThumb,
+                mediaSize = newSize,
+                privacy = effectivePrivacy, // S08: exact signed privacy
+                clearnetUrl = editPay.clearnetUrl,
+                signedMediaHash = if (isV2) mediaHash else null
+            )
+            if (success) {
+                Logger.info(TAG, "Applied EDIT_POST for ${editPay.postId}")
+                // D08: like POST, keep the signed digest for sync re-serving and download checks.
+                if (isV2) repo.recordMediaDigest(editPay.mediaId, mediaHash)
+                if (editPay.mediaMetadata != null) {
+                    val peerOnion = originOnion ?: peer?.onionAddress
+                    if (!isV2 && mediaHash != null) {
+                        Logger.warn(TAG, "EDIT_POST ${editPay.postId}: media digest not covered by the signature; downloading unverified")
+                    }
+                    autoDownload(
+                        downloadMetadata(editPay.mediaMetadata, isV2).copy(originNode = peerOnion),
+                        "friends",
+                        editPay.authorId,
+                        peerOnion
+                    )
+                }
+            } else {
+                Logger.warn(TAG, "Rejected EDIT_POST for ${editPay.postId}: author mismatch, post orphaned, or older timestamp")
+                return false
+            }
+        }
+        return true
+    }
+
+    suspend fun handleDeletePost(packet: NetworkPacket): Boolean {
+        val deletePay = packet.getDeletePostPayload() ?: return false
+        val payloadToVerify = com.noslop.app.crypto.CryptoService.encodeForSigning(
+            deletePay.postId, deletePay.authorId, deletePay.timestamp.toString()
+        )
+        val isValid = CryptoService.verify(payloadToVerify, deletePay.signature, deletePay.authorId)
+        if (!isValid) return false
+
+        val success = postDao.deletePostSafely(deletePay.postId, deletePay.authorId, deletePay.timestamp)
+        if (success) {
+            Logger.info(TAG, "Applied DELETE_POST for ${deletePay.postId}")
+        }
+        return true
+    }
+}

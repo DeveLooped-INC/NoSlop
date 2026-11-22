@@ -1,0 +1,777 @@
+// FILE: app/src/main/java/com/noslop/app/crypto/CryptoService.kt
+package com.noslop.app.crypto
+
+import android.os.Build
+import android.util.Base64
+import com.noslop.app.debug.Logger
+import org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters
+import org.bouncycastle.crypto.params.Ed25519PublicKeyParameters
+import org.bouncycastle.crypto.signers.Ed25519Signer
+import org.bouncycastle.crypto.util.PrivateKeyFactory
+import org.bouncycastle.crypto.util.PublicKeyFactory
+import java.security.*
+import java.security.spec.*
+import javax.crypto.Cipher
+import javax.crypto.KeyAgreement
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
+
+/**
+ * Cryptographic identity and messaging for NoSlop / HAI-Net mesh nodes.
+ *
+ * Signing:   Ed25519 (Raw BC lightweight API natively supporting 32-byte keys)
+ * DM Crypto: X25519 key agreement -> SHA3-256 -> ChaCha20-Poly1305
+ */
+object CryptoService {
+
+    private const val TAG = "CRYPTO"
+    private val BC_PROVIDER = org.bouncycastle.jce.provider.BouncyCastleProvider()
+
+    init {
+        try {
+            if (Security.getProvider("BC") == null) {
+                Security.addProvider(BC_PROVIDER)
+            }
+        } catch (t: Throwable) {
+            com.noslop.app.debug.Logger.warn("CRYPTO", "Could not register the Bouncy Castle provider: ${t.message}")
+        }
+    }
+
+    // Standard ASN.1 headers for 100% legacy mesh compatibility
+    private val ED25519_PKCS8_HEADER = byteArrayOf(
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20
+    )
+    private val ED25519_X509_HEADER = byteArrayOf(
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00
+    )
+
+    data class IdentityKeys(
+        val publicKeyB64: String,       // Base64 Ed25519 public key (44-byte X.509)
+        val privateKeyB64: String,      // Base64 Ed25519 private key (48-byte PKCS#8)
+        val tripcode: String,           // 6-char Base32 from SHA3-256(pubkey)
+        val onionAddress: String,       // 56-char Tor v3 .onion (HAI-Net compatible)
+        val displayName: String,        // "handle.tripcode"
+        val encPublicKeyB64: String,    // Base64 X25519 public key
+        val encPrivateKeyB64: String    // Base64 X25519 private key
+    )
+
+    /**
+     * Bulletproof parsing: Uses BC's ASN.1 factories to reliably extract the 32-byte parameters
+     * from any historical PKCS#8 / X.509 structure size.
+     */
+    fun getPublicKeyFromPrivateKey(privKeyB64: String): ByteArray {
+        val bytes = Base64.decode(privKeyB64, Base64.DEFAULT)
+        val privParams = getEd25519PrivateKeyParams(bytes)
+        return privParams.generatePublicKey().encoded
+    }
+
+    private fun getEd25519PrivateKeyParams(encoded: ByteArray): Ed25519PrivateKeyParameters {
+        if (encoded.size == 44) {
+            throw IllegalArgumentException("Expected Ed25519 private key (PKCS#8 48 bytes or raw 32/64 bytes), but received 44-byte X.509 public key")
+        }
+        if (encoded.size == 32 || encoded.size == 64) {
+            return Ed25519PrivateKeyParameters(encoded, 0)
+        }
+        return try {
+            PrivateKeyFactory.createKey(encoded) as Ed25519PrivateKeyParameters
+        } catch (e: Exception) {
+            Logger.warn(TAG, "PrivateKeyFactory parsing failed (${e.message}), extracting raw 32-byte seed")
+            val seed = if (encoded.size >= 32) encoded.copyOfRange(encoded.size - 32, encoded.size) else encoded
+            Ed25519PrivateKeyParameters(seed, 0)
+        }
+    }
+
+    private fun getEd25519PublicKeyParams(encoded: ByteArray): Ed25519PublicKeyParameters {
+        if (encoded.size == 48) {
+            throw IllegalArgumentException("Expected Ed25519 public key (X.509 44 bytes or raw 32 bytes), but received 48-byte PKCS#8 private key")
+        }
+        if (encoded.size == 32) {
+            return Ed25519PublicKeyParameters(encoded, 0)
+        }
+        return try {
+            PublicKeyFactory.createKey(encoded) as Ed25519PublicKeyParameters
+        } catch (e: Exception) {
+            Logger.warn(TAG, "PublicKeyFactory parsing failed (${e.message}), extracting raw 32-byte public key")
+            val key = if (encoded.size >= 32) encoded.copyOfRange(encoded.size - 32, encoded.size) else encoded
+            Ed25519PublicKeyParameters(key, 0)
+        }
+    }
+
+    fun generateX25519Keypair(): Pair<String, String> {
+        val kpg = org.bouncycastle.crypto.generators.X25519KeyPairGenerator()
+        kpg.init(org.bouncycastle.crypto.params.X25519KeyGenerationParameters(SecureRandom()))
+        val kp = kpg.generateKeyPair()
+        val pubParams = kp.public as org.bouncycastle.crypto.params.X25519PublicKeyParameters
+        val privParams = kp.private as org.bouncycastle.crypto.params.X25519PrivateKeyParameters
+        val pubB64 = Base64.encodeToString(
+            org.bouncycastle.crypto.util.SubjectPublicKeyInfoFactory.createSubjectPublicKeyInfo(pubParams).encoded,
+            Base64.NO_WRAP
+        )
+        val privB64 = Base64.encodeToString(
+            org.bouncycastle.crypto.util.PrivateKeyInfoFactory.createPrivateKeyInfo(privParams).encoded,
+            Base64.NO_WRAP
+        )
+        return Pair(pubB64, privB64)
+    }
+
+    fun deriveIdentityFromSeed(seed: ByteArray, handle: String): IdentityKeys {
+        val hkdfEd = org.bouncycastle.crypto.generators.HKDFBytesGenerator(org.bouncycastle.crypto.digests.SHA512Digest())
+        hkdfEd.init(org.bouncycastle.crypto.params.HKDFParameters(seed, null, "noslop-identity-ed25519-v1".toByteArray(Charsets.UTF_8)))
+        val rawSeed = ByteArray(32)
+        hkdfEd.generateBytes(rawSeed, 0, 32)
+        val privParams = org.bouncycastle.crypto.params.Ed25519PrivateKeyParameters(rawSeed, 0)
+        val rawPub = privParams.generatePublicKey().encoded
+
+        val hkdfX = org.bouncycastle.crypto.generators.HKDFBytesGenerator(org.bouncycastle.crypto.digests.SHA512Digest())
+        hkdfX.init(org.bouncycastle.crypto.params.HKDFParameters(seed, null, "noslop-identity-x25519-v1".toByteArray(Charsets.UTF_8)))
+        val rawXSeed = ByteArray(32)
+        hkdfX.generateBytes(rawXSeed, 0, 32)
+        val xPrivParams = org.bouncycastle.crypto.params.X25519PrivateKeyParameters(rawXSeed, 0)
+        val rawXPub = xPrivParams.generatePublicKey().encoded
+
+        val pubB64 = Base64.encodeToString(ED25519_X509_HEADER + rawPub, Base64.NO_WRAP)
+        val privB64 = Base64.encodeToString(ED25519_PKCS8_HEADER + rawSeed, Base64.NO_WRAP)
+        val encPubB64 = Base64.encodeToString(
+            org.bouncycastle.crypto.util.SubjectPublicKeyInfoFactory.createSubjectPublicKeyInfo(xPrivParams.generatePublicKey()).encoded,
+            Base64.NO_WRAP
+        )
+        val encPrivB64 = Base64.encodeToString(
+            org.bouncycastle.crypto.util.PrivateKeyInfoFactory.createPrivateKeyInfo(xPrivParams).encoded,
+            Base64.NO_WRAP
+        )
+
+        val tripcode = deriveTripcode(rawPub)
+        val onion = deriveOnionAddress(rawPub)
+        val formattedDisplayName = if (handle.endsWith(".$tripcode")) handle else if (handle.isNotBlank()) "$handle.$tripcode" else tripcode
+
+        return IdentityKeys(
+            publicKeyB64 = pubB64,
+            privateKeyB64 = privB64,
+            tripcode = tripcode,
+            onionAddress = onion,
+            displayName = formattedDisplayName,
+            encPublicKeyB64 = encPubB64,
+            encPrivateKeyB64 = encPrivB64
+        )
+    }
+
+    fun generateIdentity(handle: String): IdentityKeys {
+        Logger.info(TAG, "Generating Ed25519 and X25519 identity for handle: $handle")
+        return try {
+            val kpg = org.bouncycastle.crypto.generators.Ed25519KeyPairGenerator()
+            kpg.init(org.bouncycastle.crypto.params.Ed25519KeyGenerationParameters(SecureRandom()))
+            val kp = kpg.generateKeyPair()
+            val rawPub = (kp.public as Ed25519PublicKeyParameters).encoded
+            val rawSeed = (kp.private as Ed25519PrivateKeyParameters).encoded
+
+            // GUARANTEE BACKWARDS COMPATIBILITY: Wrap raw keys in ASN.1 headers before Base64 encoding.
+            val pubB64 = Base64.encodeToString(ED25519_X509_HEADER + rawPub, Base64.NO_WRAP)
+            val privB64 = Base64.encodeToString(ED25519_PKCS8_HEADER + rawSeed, Base64.NO_WRAP)
+
+            val tripcode = deriveTripcode(rawPub)
+            val onion = deriveOnionAddress(rawPub)
+
+            val encKeys = generateX25519Keypair()
+
+            Logger.info(
+                TAG, "Ed25519 and X25519 identity created",
+                "tripcode=$tripcode | onion_prefix=${onion.take(16)}... | pubkey_hash=${rawPub.sha256Hex().take(12)}"
+            )
+
+            val formattedDisplayName = if (handle.endsWith(".$tripcode")) handle else if (handle.isNotBlank()) "$handle.$tripcode" else tripcode
+
+            IdentityKeys(
+                publicKeyB64 = pubB64,
+                privateKeyB64 = privB64,
+                tripcode = tripcode,
+                onionAddress = onion,
+                displayName = formattedDisplayName,
+                encPublicKeyB64 = encKeys.first,
+                encPrivateKeyB64 = encKeys.second
+            )
+        } catch (e: Exception) {
+            Logger.error(TAG, "Key generation failed: ${e.message}")
+            throw e
+        }
+    }
+
+    private fun base32(bytes: ByteArray): String {
+        val base32Alphabet = "abcdefghijklmnopqrstuvwxyz234567"
+        val sb = StringBuilder()
+        var buffer = 0
+        var bitsLeft = 0
+        for (b in bytes) {
+            buffer = (buffer shl 8) or (b.toInt() and 0xFF)
+            bitsLeft += 8
+            while (bitsLeft >= 5) {
+                bitsLeft -= 5
+                sb.append(base32Alphabet[(buffer shr bitsLeft) and 0x1F])
+            }
+        }
+        return sb.toString()
+    }
+
+    /** D10b: length of the identity tag shown after a handle ("alice.wdbuab42"). */
+    const val TRIPCODE_LENGTH = 8
+    private const val LEGACY_TRIPCODE_LENGTH = 6
+    private const val TRIPCODE_SALT = "noslop-tag-v2"
+    private const val TRIPCODE_CACHE_SIZE = 4096
+    private val tripcodeCache = object : LinkedHashMap<String, String>(256, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean =
+            size > TRIPCODE_CACHE_SIZE
+    }
+    private val tripcodeArgon2Lock = Any()
+
+    private fun hexOf(bytes: ByteArray): String {
+        val sb = StringBuilder(bytes.size * 2)
+        for (b in bytes) {
+            val v = b.toInt() and 0xFF
+            sb.append("0123456789abcdef"[v shr 4]).append("0123456789abcdef"[v and 0x0F])
+        }
+        return sb.toString()
+    }
+
+    /**
+     * D10b: the identity tag, 8 characters of base32(Argon2id(raw Ed25519 public key,
+     * salt "noslop-tag-v2", t=2, m=19456 KiB, p=1, 16-byte output)). Argon2id makes a key whose tag
+     * copies someone else's about 2^40 Argon2 runs away, instead of 2^30 hashes for the old
+     * 6-character SHA3 tag. Results are cached per key (the tag is derived on every load and for
+     * every incoming post), and only one Argon2 run happens at a time so memory stays at ~19 MiB.
+     */
+    fun deriveTripcode(encodedPubKeyBytes: ByteArray): String {
+        val rawKeyBytes = getEd25519PublicKeyParams(encodedPubKeyBytes).encoded
+        val cacheKey = hexOf(rawKeyBytes)
+        synchronized(tripcodeCache) { tripcodeCache[cacheKey]?.let { return it } }
+        val tag = synchronized(tripcodeArgon2Lock) {
+            synchronized(tripcodeCache) { tripcodeCache[cacheKey] } ?: run {
+                val params = org.bouncycastle.crypto.params.Argon2Parameters.Builder(org.bouncycastle.crypto.params.Argon2Parameters.ARGON2_id)
+                    .withVersion(org.bouncycastle.crypto.params.Argon2Parameters.ARGON2_VERSION_13)
+                    .withIterations(2)
+                    .withMemoryAsKB(19456)
+                    .withParallelism(1)
+                    .withSalt(TRIPCODE_SALT.toByteArray(Charsets.UTF_8))
+                    .build()
+                val generator = org.bouncycastle.crypto.generators.Argon2BytesGenerator()
+                generator.init(params)
+                val out = ByteArray(16)
+                generator.generateBytes(rawKeyBytes, out, 0, out.size)
+                base32(out).take(TRIPCODE_LENGTH)
+            }
+        }
+        synchronized(tripcodeCache) { tripcodeCache[cacheKey] = tag }
+        return tag
+    }
+
+    /**
+     * D10b: the 6-character tag used before D10b (first 6 base32 characters of SHA3-256(raw key)).
+     * Only used to recognise old stored tags and handles so they can be rewritten.
+     */
+    fun deriveLegacyTripcode(encodedPubKeyBytes: ByteArray): String {
+        val pubKeyParams = getEd25519PublicKeyParams(encodedPubKeyBytes)
+        val rawKeyBytes = pubKeyParams.encoded
+
+        val digest = org.bouncycastle.crypto.digests.SHA3Digest(256)
+        val hash = ByteArray(digest.digestSize)
+        digest.update(rawKeyBytes, 0, rawKeyBytes.size)
+        digest.doFinal(hash, 0)
+
+        return base32(hash).take(LEGACY_TRIPCODE_LENGTH)
+    }
+
+    /** D10b: whether [tag] is this key's tag, in the current or the legacy (pre-D10b) form. */
+    fun isTripcodeOf(encodedPubKeyBytes: ByteArray, tag: String): Boolean = try {
+        tag.isNotBlank() && (tag == deriveTripcode(encodedPubKeyBytes) || tag == deriveLegacyTripcode(encodedPubKeyBytes))
+    } catch (_: Exception) {
+        false
+    }
+
+    /** D10b: [handle] without a trailing ".tag" of this key (current or legacy form). */
+    fun stripIdentityTag(handle: String, encodedPubKeyBytes: ByteArray): String {
+        val tags = try {
+            listOf(deriveTripcode(encodedPubKeyBytes), deriveLegacyTripcode(encodedPubKeyBytes))
+        } catch (_: Exception) {
+            return handle
+        }
+        for (tag in tags) {
+            if (handle.endsWith(".$tag")) return handle.removeSuffix(".$tag")
+        }
+        return handle
+    }
+
+    /** D10b: the tag of a Base64 public key, or null when the key can't be read. */
+    fun tripcodeOfKey(publicKeyB64: String): String? = try {
+        deriveTripcode(Base64.decode(publicKeyB64, Base64.DEFAULT))
+    } catch (_: Exception) {
+        null
+    }
+
+    fun deriveOnionAddress(encodedPubKeyBytes: ByteArray): String {
+        val pubKeyParams = getEd25519PublicKeyParams(encodedPubKeyBytes)
+        val rawKey = pubKeyParams.encoded
+
+        val version = byteArrayOf(0x03)
+        val prefix = ".onion checksum".toByteArray(Charsets.UTF_8)
+
+        val checksumInput = prefix + rawKey + version
+        val digest = org.bouncycastle.crypto.digests.SHA3Digest(256)
+        val hash = ByteArray(digest.digestSize)
+        digest.update(checksumInput, 0, checksumInput.size)
+        digest.doFinal(hash, 0)
+        val checksum = hash.copyOfRange(0, 2)
+
+        val payload = rawKey + checksum + version
+        val encoded = base32(payload).padEnd(56, 'a')
+
+        return "${encoded.take(56)}.onion"
+    }
+
+    /**
+     * Audit Finding #4: Length-prefixed payload encoder for cryptographic signing.
+     * Prevents delimiter-collision attacks in concatenated payloads.
+     */
+    fun encodeForSigning(vararg parts: String?): String {
+        return parts.joinToString("") { part ->
+            if (part == null) "0:" else "${part.length}:$part"
+        }
+    }
+
+    /**
+     * C02: Canonical v2 handshake signing encoder binding encryption keys, recipient, and nonce.
+     */
+    fun canonicalHandshakePayloadV2(
+        fromUserId: String,
+        fromUsername: String,
+        fromHomeNode: String,
+        fromEncryptionPublicKey: String,
+        targetUserId: String,
+        nonce: String,
+        timestamp: Long,
+        authorAvatarB64: String? = null,
+        bio: String? = null,
+        intro: String? = null
+    ): String {
+        val parts = mutableListOf<String?>(
+            "noslop-hs-v2",
+            fromUserId,
+            fromUsername,
+            fromHomeNode,
+            fromEncryptionPublicKey,
+            targetUserId,
+            nonce,
+            timestamp.toString(),
+            authorAvatarB64,
+            bio
+        )
+        // D10b: the signed "intro" of a CONNECTION_REQUEST (ContactIntro.QR_CAMERA). Appended only
+        // when present, so packets without it sign exactly as before. The length-prefixed encoding
+        // keeps the two forms distinct: adding or removing the field breaks the signature.
+        if (intro != null) parts.add(intro)
+        return encodeForSigning(*parts.toTypedArray())
+    }
+
+    /**
+     * S2 (round E2): what an ANNOUNCE_PEER is signed over. v1 covered only the author and the time, so the
+     * onion address it carries (which receivers store) could be swapped by anyone relaying it.
+     */
+    fun canonicalAnnouncePeerV2(authorId: String, onionAddress: String?, timestamp: Long): String =
+        encodeForSigning("noslop-announce-v2", authorId, onionAddress ?: "", timestamp.toString())
+
+    /** S2 (round E2): whether [onionAddress] is the onion address derived from [publicKeyB64]. */
+    fun isOnionOf(publicKeyB64: String, onionAddress: String): Boolean = try {
+        deriveOnionAddress(Base64.decode(publicKeyB64, Base64.DEFAULT)).equals(onionAddress.trim(), ignoreCase = true)
+    } catch (_: Exception) {
+        false
+    }
+
+    /** The onion address derived from [publicKeyB64], or null when the key can't be read. */
+    fun onionOf(publicKeyB64: String): String? = try {
+        deriveOnionAddress(Base64.decode(publicKeyB64, Base64.DEFAULT))
+    } catch (_: Exception) {
+        null
+    }
+
+    fun sign(payload: String, privateKeyB64: String): String {
+        val bytes = Base64.decode(privateKeyB64, Base64.DEFAULT)
+        val privKeyParams = getEd25519PrivateKeyParams(bytes)
+        
+        // Bypass JCA/ASN.1 entirely and use BouncyCastle's lightweight crypto API directly.
+        val signer = Ed25519Signer()
+        signer.init(true, privKeyParams)
+        
+        val msgBytes = payload.toByteArray(Charsets.UTF_8)
+        signer.update(msgBytes, 0, msgBytes.size)
+        val sigBytes = signer.generateSignature()
+        
+        return Base64.encodeToString(sigBytes, Base64.NO_WRAP)
+    }
+
+    fun verify(payload: String, signatureB64: String, publicKeyB64: String): Boolean {
+        return try {
+            val bytes = Base64.decode(publicKeyB64, Base64.DEFAULT)
+            val pubKeyParams = getEd25519PublicKeyParams(bytes)
+            
+            // Bypass JCA/ASN.1 entirely.
+            val verifier = Ed25519Signer()
+            verifier.init(false, pubKeyParams)
+            
+            val msgBytes = payload.toByteArray(Charsets.UTF_8)
+            verifier.update(msgBytes, 0, msgBytes.size)
+            
+            val sigBytes = Base64.decode(signatureB64, Base64.DEFAULT)
+            verifier.verifySignature(sigBytes)
+        } catch (e: Exception) {
+            Logger.warn(TAG, "Ed25519 signature verification failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * D05: AAD domain labels. A `MESSAGE` keeps the label it always had (so peers on earlier builds
+     * still read it); a `DM_ACK` has its own, so an acknowledgement can never be passed off as a
+     * message under the same id, or the other way round.
+     */
+    const val DM_AAD_MESSAGE = "noslop-dm-v2"
+    const val DM_AAD_ACK = "noslop-dm-ack-v3"
+
+    /**
+     * C08: Authenticated Additional Data (AAD) binding sender, recipient, message ID, group ID, and timestamp.
+     * D05: [domain] separates messages from acknowledgements (see [DM_AAD_ACK]).
+     */
+    fun canonicalDmAadV2(
+        senderEdPub: String,
+        recipientEdPub: String,
+        msgId: String,
+        groupId: String?,
+        timestamp: Long,
+        domain: String = DM_AAD_MESSAGE
+    ): ByteArray {
+        val aadStr = encodeForSigning(
+            domain,
+            senderEdPub,
+            recipientEdPub,
+            msgId,
+            groupId ?: "",
+            timestamp.toString()
+        )
+        return aadStr.toByteArray(Charsets.UTF_8)
+    }
+
+    /**
+     * C08: Derives a directional 32-byte ChaCha20-Poly1305 key via HKDF-SHA256 from X25519 shared secret.
+     */
+    fun deriveDirectionalKeyV2(
+        sharedSecret: ByteArray,
+        senderEdPub: String,
+        recipientEdPub: String
+    ): ByteArray {
+        val sorted = if (senderEdPub <= recipientEdPub) {
+            Pair(senderEdPub, recipientEdPub)
+        } else {
+            Pair(recipientEdPub, senderEdPub)
+        }
+        val digest = org.bouncycastle.crypto.digests.SHA256Digest()
+        val b1 = sorted.first.toByteArray(Charsets.UTF_8)
+        val b2 = sorted.second.toByteArray(Charsets.UTF_8)
+        digest.update(b1, 0, b1.size)
+        digest.update(b2, 0, b2.size)
+        val salt = ByteArray(digest.digestSize)
+        digest.doFinal(salt, 0)
+
+        val info = "noslop-dm-v2|$senderEdPub->$recipientEdPub".toByteArray(Charsets.UTF_8)
+        val hkdf = org.bouncycastle.crypto.generators.HKDFBytesGenerator(org.bouncycastle.crypto.digests.SHA256Digest())
+        hkdf.init(org.bouncycastle.crypto.params.HKDFParameters(sharedSecret, salt, info))
+        val kDir = ByteArray(32)
+        hkdf.generateBytes(kDir, 0, 32)
+        return kDir
+    }
+
+    private fun calculateX25519SharedSecret(myEncPrivB64: String, theirEncPubB64: String): ByteArray {
+        val myPrivParams = getX25519PrivateKeyParams(Base64.decode(myEncPrivB64, Base64.DEFAULT))
+        val theirPubParams = getX25519PublicKeyParams(Base64.decode(theirEncPubB64, Base64.DEFAULT))
+        val agreement = org.bouncycastle.crypto.agreement.X25519Agreement()
+        agreement.init(myPrivParams)
+        val secret = ByteArray(agreement.agreementSize)
+        agreement.calculateAgreement(theirPubParams, secret, 0)
+        return secret
+    }
+
+    private fun chacha20Poly1305Encrypt(key: ByteArray, iv: ByteArray, plaintext: ByteArray, aad: ByteArray? = null): ByteArray {
+        val cipher = org.bouncycastle.crypto.modes.ChaCha20Poly1305()
+        val params = org.bouncycastle.crypto.params.AEADParameters(
+            org.bouncycastle.crypto.params.KeyParameter(key),
+            128,
+            iv,
+            aad
+        )
+        cipher.init(true, params)
+        val out = ByteArray(cipher.getOutputSize(plaintext.size))
+        val len = cipher.processBytes(plaintext, 0, plaintext.size, out, 0)
+        cipher.doFinal(out, len)
+        return out
+    }
+
+    private fun chacha20Poly1305Decrypt(key: ByteArray, iv: ByteArray, ciphertext: ByteArray, aad: ByteArray? = null): ByteArray {
+        val cipher = org.bouncycastle.crypto.modes.ChaCha20Poly1305()
+        val params = org.bouncycastle.crypto.params.AEADParameters(
+            org.bouncycastle.crypto.params.KeyParameter(key),
+            128,
+            iv,
+            aad
+        )
+        cipher.init(false, params)
+        val out = ByteArray(cipher.getOutputSize(ciphertext.size))
+        val len = cipher.processBytes(ciphertext, 0, ciphertext.size, out, 0)
+        val finalLen = cipher.doFinal(out, len)
+        return out.copyOfRange(0, len + finalLen)
+    }
+
+    /**
+     * C08: DM v2 Directional encryption with AAD binding.
+     */
+    fun encryptDMV2(
+        plaintext: String,
+        theirEncPubB64: String,
+        myEncPrivB64: String,
+        senderEdPub: String,
+        recipientEdPub: String,
+        msgId: String,
+        groupId: String? = null,
+        timestamp: Long = System.currentTimeMillis(),
+        domain: String = DM_AAD_MESSAGE
+    ): Pair<String, String> {
+        val sharedSecret = calculateX25519SharedSecret(myEncPrivB64, theirEncPubB64)
+        val chachaKey = deriveDirectionalKeyV2(sharedSecret, senderEdPub, recipientEdPub)
+        val iv = ByteArray(12).also { SecureRandom().nextBytes(it) }
+        val aad = canonicalDmAadV2(senderEdPub, recipientEdPub, msgId, groupId, timestamp, domain)
+        val ciphertext = chacha20Poly1305Encrypt(chachaKey, iv, plaintext.toByteArray(Charsets.UTF_8), aad)
+
+        return Pair(
+            Base64.encodeToString(ciphertext, Base64.NO_WRAP),
+            Base64.encodeToString(iv, Base64.NO_WRAP)
+        )
+    }
+
+    /**
+     * C08: DM v2 Directional decryption with AAD authentication.
+     */
+    fun decryptDMV2(
+        ciphertextB64: String,
+        nonceB64: String,
+        theirEncPubB64: String,
+        myEncPrivB64: String,
+        senderEdPub: String,
+        recipientEdPub: String,
+        msgId: String,
+        groupId: String? = null,
+        timestamp: Long,
+        domain: String = DM_AAD_MESSAGE
+    ): String? {
+        return try {
+            val sharedSecret = calculateX25519SharedSecret(myEncPrivB64, theirEncPubB64)
+            val chachaKey = deriveDirectionalKeyV2(sharedSecret, senderEdPub, recipientEdPub)
+            val iv = Base64.decode(nonceB64, Base64.DEFAULT)
+            val aad = canonicalDmAadV2(senderEdPub, recipientEdPub, msgId, groupId, timestamp, domain)
+            val decrypted = chacha20Poly1305Decrypt(chachaKey, iv, Base64.decode(ciphertextB64, Base64.DEFAULT), aad)
+            String(decrypted, Charsets.UTF_8)
+        } catch (e: Exception) {
+            Logger.debug(TAG, "DM v2 decryption failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * C08: Helper to decrypt a direct message for UI rendering, supporting both v2 directional keys
+     * and fallback v1 legacy messages.
+     */
+    fun decryptDMForDisplay(
+        ciphertextB64: String,
+        nonceB64: String,
+        theirEncPubB64: String,
+        myEncPrivB64: String,
+        myEdPub: String,
+        senderEdPub: String,
+        peerEdPub: String,
+        msgId: String,
+        timestamp: Long
+    ): String? {
+        val actualSender = if (senderEdPub == myEdPub) myEdPub else senderEdPub
+        val actualRecipient = if (senderEdPub == myEdPub) peerEdPub else myEdPub
+        val v2 = decryptDMV2(
+            ciphertextB64 = ciphertextB64,
+            nonceB64 = nonceB64,
+            theirEncPubB64 = theirEncPubB64,
+            myEncPrivB64 = myEncPrivB64,
+            senderEdPub = actualSender,
+            recipientEdPub = actualRecipient,
+            msgId = msgId,
+            groupId = null,
+            timestamp = timestamp
+        )
+        if (v2 != null) return v2
+        return decryptDM(ciphertextB64, nonceB64, theirEncPubB64, myEncPrivB64)
+    }
+
+    fun encryptDM(plaintext: String, theirEncPubB64: String, myEncPrivB64: String): Pair<String, String> {
+        val sharedSecret = calculateX25519SharedSecret(myEncPrivB64, theirEncPubB64)
+
+        val digest = org.bouncycastle.crypto.digests.SHA3Digest(256)
+        val chachaKey = ByteArray(digest.digestSize)
+        digest.update(sharedSecret, 0, sharedSecret.size)
+        digest.doFinal(chachaKey, 0)
+
+        val iv = ByteArray(12).also { SecureRandom().nextBytes(it) }
+        val ciphertext = chacha20Poly1305Encrypt(chachaKey, iv, plaintext.toByteArray(Charsets.UTF_8), null)
+
+        return Pair(
+            Base64.encodeToString(ciphertext, Base64.NO_WRAP),
+            Base64.encodeToString(iv, Base64.NO_WRAP)
+        )
+    }
+
+    fun decryptDM(
+        ciphertextB64: String, nonceB64: String,
+        theirEncPubB64: String, myEncPrivB64: String
+    ): String? {
+        return try {
+            val sharedSecret = calculateX25519SharedSecret(myEncPrivB64, theirEncPubB64)
+
+            val digest = org.bouncycastle.crypto.digests.SHA3Digest(256)
+            val chachaKey = ByteArray(digest.digestSize)
+            digest.update(sharedSecret, 0, sharedSecret.size)
+            digest.doFinal(chachaKey, 0)
+
+            val iv = Base64.decode(nonceB64, Base64.DEFAULT)
+            val decrypted = chacha20Poly1305Decrypt(chachaKey, iv, Base64.decode(ciphertextB64, Base64.DEFAULT), null)
+            String(decrypted, Charsets.UTF_8)
+        } catch (e: Exception) {
+            Logger.warn(TAG, "DM decryption failed: ${e.message}")
+            null
+        }
+    }
+
+    private const val SAFETY_FP_LABEL = "noslop-safety-fp-v1"
+
+    /**
+     * C11/D10: the 20-character Base32 safety fingerprint of an identity, shown as five groups of
+     * four (`ABCD-EFGH-IJKL-MNOP-QRST`): SHA3-256("noslop-safety-fp-v1" || raw Ed25519 public key ||
+     * raw X25519 public key). Both keys are reduced to their raw 32 bytes first, so an identity has
+     * the same fingerprint whether a key was stored raw or X.509/SPKI-wrapped.
+     *
+     * Returns null when either key is missing or unreadable — never a placeholder that two broken
+     * keys could "match".
+     */
+    fun deriveSafetyFingerprint(edPublicKeyB64: String, encPublicKeyB64: String): String? {
+        if (edPublicKeyB64.isBlank() || encPublicKeyB64.isBlank()) return null
+        return try {
+            val ed = getEd25519PublicKeyParams(Base64.decode(edPublicKeyB64, Base64.DEFAULT)).encoded
+            val enc = getX25519PublicKeyParams(Base64.decode(encPublicKeyB64, Base64.DEFAULT)).encoded
+            val label = SAFETY_FP_LABEL.toByteArray(Charsets.UTF_8)
+            val digest = org.bouncycastle.crypto.digests.SHA3Digest(256)
+            digest.update(label, 0, label.size)
+            digest.update(ed, 0, ed.size)
+            digest.update(enc, 0, enc.size)
+            val hash = ByteArray(digest.digestSize)
+            digest.doFinal(hash, 0)
+            base32(hash).take(20).uppercase(java.util.Locale.ROOT).chunked(4).joinToString("-")
+        } catch (e: Exception) {
+            Logger.warn(TAG, "Safety fingerprint derivation failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * D10b: the short check code people compare before approving a request: the first two groups
+     * of the safety fingerprint (`ABCD-EFGH`). It is shown next to name.tag; matching both by
+     * accident needs a key that matches the Argon2id tag as well. Null when the fingerprint is.
+     */
+    fun deriveCheckCode(edPublicKeyB64: String, encPublicKeyB64: String): String? =
+        deriveSafetyFingerprint(edPublicKeyB64, encPublicKeyB64)?.take(9)
+
+    /**
+     * D09: the X25519 public key of [privateB64], in the encoding identities store
+     * (SubjectPublicKeyInfo, Base64 NO_WRAP, as [generateX25519Keypair]); null if the key can't be read.
+     */
+    fun x25519PublicKeyFromPrivate(privateB64: String): String? = try {
+        val priv = getX25519PrivateKeyParams(Base64.decode(privateB64, Base64.DEFAULT))
+        Base64.encodeToString(
+            org.bouncycastle.crypto.util.SubjectPublicKeyInfoFactory.createSubjectPublicKeyInfo(priv.generatePublicKey()).encoded,
+            Base64.NO_WRAP
+        )
+    } catch (e: Exception) {
+        Logger.warn(TAG, "X25519 public key derivation failed: ${e.message}")
+        null
+    }
+
+    /** D09: whether two stored X25519 public keys are the same key, whatever their encoding (raw or SPKI). */
+    fun sameX25519PublicKey(aB64: String, bB64: String): Boolean = try {
+        val a = getX25519PublicKeyParams(Base64.decode(aB64, Base64.DEFAULT)).encoded
+        val b = getX25519PublicKeyParams(Base64.decode(bB64, Base64.DEFAULT)).encoded
+        a.contentEquals(b)
+    } catch (_: Exception) {
+        false
+    }
+
+    fun verifyX25519Keypair(publicB64: String, privateB64: String): Boolean {
+        return try {
+            val (ephPub, ephPriv) = generateX25519Keypair()
+            val probePayload = "noslop_x25519_probe_${System.currentTimeMillis()}"
+            val (ciphertext, nonce) = encryptDM(probePayload, publicB64, ephPriv)
+            val decrypted = decryptDM(ciphertext, nonce, ephPub, privateB64)
+            decrypted == probePayload
+        } catch (e: Exception) {
+            Logger.warn(TAG, "X25519 keypair verification failed: ${e.message}")
+            false
+        }
+    }
+
+    fun getRawEd25519Seed(privKeyB64: String?): String? {
+        if (privKeyB64 == null) return null
+        return try {
+            val bytes = Base64.decode(privKeyB64, Base64.DEFAULT)
+            val privKeyParams = getEd25519PrivateKeyParams(bytes)
+            val seed = privKeyParams.encoded
+            
+            // Tor ADD_ONION ED25519-V3 expects the 64-byte expanded secret key
+            val md = MessageDigest.getInstance("SHA-512")
+            val expanded = md.digest(seed)
+            
+            expanded[0] = (expanded[0].toInt() and 248).toByte()
+            expanded[31] = (expanded[31].toInt() and 127).toByte()
+            expanded[31] = (expanded[31].toInt() or 64).toByte()
+            
+            Base64.encodeToString(expanded, Base64.NO_WRAP)
+        } catch (e: Exception) {
+            Logger.error(TAG, "ED25519-V3 key conversion failed: ${e.message}")
+            null
+        }
+    }
+
+    private fun getX25519PrivateKeyParams(bytes: ByteArray): org.bouncycastle.crypto.params.X25519PrivateKeyParameters {
+        if (bytes.size == 32) {
+            return org.bouncycastle.crypto.params.X25519PrivateKeyParameters(bytes, 0)
+        }
+        return try {
+            PrivateKeyFactory.createKey(bytes) as org.bouncycastle.crypto.params.X25519PrivateKeyParameters
+        } catch (_: Exception) {
+            val raw = if (bytes.size >= 32) bytes.copyOfRange(bytes.size - 32, bytes.size) else bytes
+            org.bouncycastle.crypto.params.X25519PrivateKeyParameters(raw, 0)
+        }
+    }
+
+    private fun getX25519PublicKeyParams(bytes: ByteArray): org.bouncycastle.crypto.params.X25519PublicKeyParameters {
+        if (bytes.size == 32) {
+            return org.bouncycastle.crypto.params.X25519PublicKeyParameters(bytes, 0)
+        }
+        return try {
+            PublicKeyFactory.createKey(bytes) as org.bouncycastle.crypto.params.X25519PublicKeyParameters
+        } catch (_: Exception) {
+            val raw = if (bytes.size >= 32) bytes.copyOfRange(bytes.size - 32, bytes.size) else bytes
+            org.bouncycastle.crypto.params.X25519PublicKeyParameters(raw, 0)
+        }
+    }
+
+    private fun ByteArray.sha256Hex(): String {
+        val hash = MessageDigest.getInstance("SHA-256").digest(this)
+        return hash.joinToString("") { "%02x".format(it) }
+    }
+}

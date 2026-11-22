@@ -1,0 +1,14 @@
+// FILE: app/src/main/java/com/noslop/app/ui/theme/Color.kt
+package com.noslop.app.ui.theme
+
+import androidx.compose.ui.graphics.Color
+
+// Premium brutalist "NoSlop" theme palette
+val PrimaryBlack = Color(0xFF0A0A0A)
+val AccentGreen = Color(0xFF00FF88)
+val SurfaceDark = Color(0xFF141414)
+val BorderSubtle = Color(0xFF2A2A2A)
+val TextLight = Color(0xFFF0F0F0)
+val TextMuted = Color(0xFF666666)
+val DestructiveRed = Color(0xFFFF4444)
+val TemporaryAmber = Color(0xFFFFB300)

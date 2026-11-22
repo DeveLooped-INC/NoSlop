@@ -1,0 +1,1311 @@
+package com.noslop.app.ui.components
+
+import com.noslop.app.util.tr
+
+import android.widget.Toast
+import androidx.compose.animation.*
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.foundation.lazy.items
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.noslop.app.data.*
+import com.noslop.app.ui.*
+import com.noslop.app.ui.theme.*
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+private fun getSourceLabel(item: FeedItem): String {
+    val fromApi = when (item.apiSource) {
+        "youtube" -> "YouTube"
+        "reddit" -> "Reddit"
+        "pexels" -> "Pexels"
+        "jamendo" -> "Jamendo"
+        "internet_archive" -> "Archive.org"
+        "podcast_index" -> "Podcast"
+        "newsapi" -> "News"
+        "guardian" -> "Guardian"
+        "nasa" -> "NASA"
+        "vimeo" -> "Vimeo"
+        "wikimedia" -> "Wikimedia"
+        "wikipedia" -> "Wikipedia"
+        "hackernews", "hn" -> "Hacker News"
+        "openverse" -> "Openverse"
+        "artic" -> "Art Institute"
+        else -> null
+    }
+    if (fromApi != null) return fromApi
+
+    if (!item.sourceId.isNullOrBlank()) {
+        val cleanSource = item.sourceId
+            .removePrefix("api-")
+            .removePrefix("source-")
+            .removeSuffix("-search")
+            .replace("-", " ")
+            .replace("_", " ")
+            .split(" ")
+            .filter { it.isNotBlank() }
+            .joinToString(" ") { word -> word.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.US) else it.toString() } }
+        if (cleanSource.isNotBlank() && cleanSource != "Rss" && cleanSource != "Atom") {
+            return cleanSource
+        }
+    }
+
+    if (!item.url.isNullOrBlank()) {
+        return try {
+            val host = android.net.Uri.parse(item.url).host?.removePrefix("www.") ?: ""
+            if (host.isNotBlank()) {
+                val name = host.substringBefore(".")
+                name.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.US) else it.toString() }
+            } else "Web"
+        } catch (_: Exception) { "Web" }
+    }
+
+    return "Web"
+}
+
+private fun <T> emptyFlow(): kotlinx.coroutines.flow.Flow<List<T>> = kotlinx.coroutines.flow.flowOf(emptyList())
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun FullScreenFeedCard(
+    item: FeedItem, 
+    isVisible: Boolean = true, 
+    isNextSlide: Boolean = false,
+    onShareToMesh: () -> Unit, 
+    viewModel: NoSlopViewModel? = null,
+    bottomSlideOffset: Float = 0f,
+    rightSlideOffset: Float = 0f
+) {
+    val rawText = if (!item.fullContent.isNullOrBlank()) item.fullContent 
+                  else if (!item.excerpt.isNullOrBlank()) item.excerpt
+                  else ""
+    val content = remember(rawText) { com.noslop.app.feeds.FeedParser.stripHtml(rawText) }
+    val context = LocalContext.current
+    val resolvedUrl = resolveMediaUrl(item.mediaUrl ?: (if (item.mediaType == "image") item.thumbnailUrl else null), context)
+
+    val displayImageUrl = resolvedUrl ?: item.thumbnailUrl
+    val isVisualCategory = item.apiSource in listOf("pexels", "nasa", "wikimedia", "artic", "openverse") || item.sourceId in listOf("hi-fructose", "juxtapoz", "colossal", "500px-popular", "flickr-explore", "petapixel")
+    val hasVisualMedia = item.mediaType == "image" || (displayImageUrl?.let { url -> 
+        url.contains(".jpg") || url.contains(".jpeg") || url.contains(".png") || url.contains(".webp") || url.contains(".gif")
+    } ?: false)
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(PrimaryBlack)
+    ) {
+        if (resolvedUrl != null) {
+            when {
+                item.mediaType == "video" || 
+                resolvedUrl.contains(".mp4") || 
+                resolvedUrl.contains(".mkv") || 
+                resolvedUrl.contains(".m3u8") ||
+                resolvedUrl.contains("youtube") ||
+                resolvedUrl.contains("vimeo") ||
+                resolvedUrl.contains("archive.org/embed") -> {
+                    val rawMediaId = item.mediaUrl?.substringAfterLast("/")
+                    val isMesh = item.sourceId == "mesh_shared" || item.id.startsWith("mesh_")
+                    
+                    var newlyDownloaded by remember { mutableStateOf(false) }
+                    val isDownloaded = newlyDownloaded || (rawMediaId != null && com.noslop.app.mesh.MediaManager.isMediaDownloaded(rawMediaId, item.mediaType ?: "video"))
+                    val canPlay = isDownloaded || !isMesh || item.url != null
+                    val stableKeyForRestore = (item.mediaUrl ?: item.url)?.trim()?.takeIf { it.isNotBlank() }
+
+                    if (canPlay) {
+                        VideoPlayer(url = resolvedUrl, isVisible = isVisible, isNextSlide = isNextSlide, thumbnailUrl = item.thumbnailUrl, stableKey = stableKeyForRestore)
+                    } else {
+                        val downloadProgress by (viewModel?.downloadProgress?.collectAsState() ?: androidx.compose.runtime.mutableStateOf(emptyMap()))
+                        val progress = rawMediaId?.let { downloadProgress[it] } ?: 0
+                        
+                        LaunchedEffect(progress) {
+                            if (progress == 100) {
+                                newlyDownloaded = true
+                            }
+                        }
+
+                        if (isVisible) {
+                            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                BlurredImageBackground(url = item.thumbnailUrl ?: resolvedUrl)
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(PrimaryBlack.copy(alpha=0.3f))
+                                        .clickable {
+                                            val meta = com.noslop.app.mesh.MediaManager.getMetadataSync(rawMediaId ?: "")
+                                            if (meta != null) {
+                                                val origin = item.mediaUrl?.substringAfter("noslop://")?.substringBefore("/") ?: ""
+                                                viewModel?.startMediaDownload(meta, origin)
+                                            }
+                                        }
+                                        .padding(16.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        Icon(Icons.Default.Download, contentDescription = "Download".tr, tint = AccentGreen, modifier = Modifier.size(48.dp))
+                                        if (progress > 0) {
+                                            Spacer(modifier = Modifier.height(8.dp))
+                                            LinearProgressIndicator(progress = { progress / 100f }, color = AccentGreen)
+                                            Text("Downloading $progress%", color = TextLight, fontSize = 12.sp)
+                                        } else {
+                                            Text("Tap to Download Video".tr, color = TextLight, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            BlurredImageBackground(url = item.thumbnailUrl ?: resolvedUrl)
+                        }
+                    }
+                }
+                item.mediaType == "audio" || 
+                resolvedUrl.contains(".mp3") || 
+                resolvedUrl.contains(".wav") ||
+                resolvedUrl.contains(".m4a") ||
+                resolvedUrl.contains(".aac") ||
+                resolvedUrl.contains(".ogg") ||
+                resolvedUrl.contains(".flac") -> {
+                    val stableKeyForRestore = item.mediaUrl ?: item.url
+                    AudioPlayer(url = resolvedUrl, isVisible = isVisible, stableKey = stableKeyForRestore)
+                }
+                isVisualCategory && hasVisualMedia -> {
+                    val fallback = if (!item.thumbnailUrl.isNullOrBlank() && item.thumbnailUrl != displayImageUrl) item.thumbnailUrl else null
+                    BlurredImageBackground(url = displayImageUrl ?: resolvedUrl ?: "", fallbackUrl = fallback)
+                }
+                item.mediaType == "image" || 
+                (displayImageUrl != null && (displayImageUrl.contains(".jpg") || 
+                displayImageUrl.contains(".jpeg") || 
+                displayImageUrl.contains(".png") || 
+                displayImageUrl.contains(".webp") || 
+                displayImageUrl.contains(".gif"))) -> {
+                    BlurredImageBackground(url = displayImageUrl ?: "", fallbackUrl = item.thumbnailUrl)
+                }
+                item.mediaType == "image" || 
+                resolvedUrl.contains(".jpg") || 
+                resolvedUrl.contains(".jpeg") || 
+                resolvedUrl.contains(".png") || 
+                resolvedUrl.contains(".webp") || 
+                resolvedUrl.contains(".gif") -> {
+                    BlurredImageBackground(url = resolvedUrl, fallbackUrl = item.thumbnailUrl)
+                }
+                else -> {
+                    val sourceLabel = getSourceLabel(item)
+                    SegmentedArticleReader(
+                        content = content,
+                        title = item.title,
+                        author = item.author,
+                        sourceLabel = sourceLabel,
+                        thumbnailUrl = item.thumbnailUrl ?: resolvedUrl,
+                        articleUrl = item.url,
+                        publishedAt = item.publishedAt
+                    )
+                }
+            }
+        } else {
+            val sourceLabel = getSourceLabel(item)
+            SegmentedArticleReader(
+                content = content,
+                title = item.title,
+                author = item.author,
+                sourceLabel = sourceLabel,
+                thumbnailUrl = item.thumbnailUrl,
+                articleUrl = item.url,
+                publishedAt = item.publishedAt
+            )
+        }
+
+        val isArticle = item.mediaType.isNullOrEmpty()
+        if (!isArticle) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .align(Alignment.BottomStart)
+                    .graphicsLayer { 
+                        translationY = bottomSlideOffset 
+                        alpha = if (bottomSlideOffset > 0f) (1f - (bottomSlideOffset / 300f)).coerceIn(0f, 1f) else 1f
+                    }
+                    .background(
+                        Brush.verticalGradient(
+                            colors = listOf(Color.Transparent, PrimaryBlack.copy(alpha = 0.85f))
+                        )
+                    )
+                    .padding(horizontal = 24.dp, vertical = 32.dp)
+            ) {
+                Column(modifier = Modifier.fillMaxWidth(0.8f)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        // NOSLOP_SOURCE_CREDIT_V1 — the source badge links back to the item's own page.
+                        var showSourcePage by remember { mutableStateOf(false) }
+                        val sourcePage = item.url?.takeIf { it.startsWith("http") }
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(AccentGreen.copy(alpha = 0.15f))
+                                .then(if (sourcePage != null) Modifier.clickable { showSourcePage = true } else Modifier)
+                                .padding(horizontal = 8.dp, vertical = 2.dp)
+                        ) {
+                            val badgeText = getSourceLabel(item)
+                            Text(if (sourcePage != null) "$badgeText ↗" else badgeText, color = AccentGreen, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        }
+                        if (showSourcePage && sourcePage != null) {
+                            com.noslop.app.ui.ArticleWebViewDialog(url = sourcePage, title = item.title, onDismiss = { showSourcePage = false })
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        val creatorKeywords by (viewModel?.creatorKeywords ?: kotlinx.coroutines.flow.MutableStateFlow("")).collectAsState()
+                        val currentKeywordsSet = remember(creatorKeywords) {
+                            creatorKeywords.split(",").map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+                        }
+                        var showChannelPrefModal by remember { mutableStateOf(false) }
+                        val authorName = item.author
+
+                        Text(
+                            text = item.author ?: "Unknown Source",
+                            color = AccentGreen,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.then(
+                                if (!authorName.isNullOrBlank()) Modifier.clickable { showChannelPrefModal = true }
+                                else Modifier
+                            )
+                        )
+
+                        if (showChannelPrefModal && !authorName.isNullOrBlank()) {
+                            val isAlreadyIn = currentKeywordsSet.any { it.equals(authorName, ignoreCase = true) }
+                            val bannedList = viewModel?.bannedChannels?.collectAsState()?.value ?: emptyList()
+                            val isBanned = bannedList.any { it.equals(authorName, ignoreCase = true) }
+                            val allFeedItems by (viewModel?.feedItems ?: kotlinx.coroutines.flow.flowOf(emptyList())).collectAsState(initial = emptyList())
+                            val creatorFeedItems = remember(authorName, allFeedItems) {
+                                allFeedItems.filter { it.author?.equals(authorName, ignoreCase = true) == true }
+                            }
+                            com.noslop.app.ui.components.ChannelPreferenceModal(
+                                channelName = authorName,
+                                isAlreadyInPreferences = isAlreadyIn,
+                                isBanned = isBanned,
+                                creatorItems = creatorFeedItems,
+                                onItemClick = { clickedItem ->
+                                    viewModel?.ensurePostInFeed(clickedItem.id)
+                                },
+                                onAdd = {
+                                    val updated = (currentKeywordsSet + authorName).joinToString(", ")
+                                    viewModel?.saveCreatorKeywords(updated)
+                                },
+                                onRemove = {
+                                    val updated = currentKeywordsSet.filter { !it.equals(authorName, ignoreCase = true) }.joinToString(", ")
+                                    viewModel?.saveCreatorKeywords(updated)
+                                },
+                                onBan = { viewModel?.banChannel(authorName) },
+                                onUnban = { viewModel?.unbanChannel(authorName) },
+                                onDismiss = { showChannelPrefModal = false }
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Text(
+                        text = item.title,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = TextLight,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis
+                    )
+
+                    // NOSLOP_SOURCE_CREDIT_V1 — openly licensed media show their licence.
+                    val licenceLine = SourceCredit.licenceLine(item.apiSource, item.excerpt)
+                    if (licenceLine != null) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = licenceLine,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TextMuted,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    Text(
+                        text = SimpleDateFormat("MMM dd, yyyy · HH:mm", Locale.getDefault()).format(Date(item.publishedAt)),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextMuted
+                    )
+                }
+            }
+        }
+
+        val anchorId = remember(item.url) { item.url?.let { viewModel?.getReactionAnchorIdForUrl(it) } ?: item.id }
+        val reactions by (viewModel?.getReactionsForPost(anchorId) ?: emptyFlow()).collectAsState(initial = emptyList())
+        val votes by (viewModel?.getVotesForPost(anchorId) ?: emptyFlow()).collectAsState(initial = emptyList())
+        val comments by (viewModel?.getCommentsForPost(anchorId) ?: emptyFlow()).collectAsState(initial = emptyList())
+
+        val upvotes = votes.count { it.voteType == "upvote" }
+        val downvotes = votes.count { it.voteType == "downvote" }
+        val explicitNegativeReactions = reactions.count { it.reactionType in setOf("downvote", "slop", "vomit", "clown", "noslop") }
+        val totalSignals = reactions.size + votes.size
+        val negativeSignals = downvotes + explicitNegativeReactions
+        val negativeRatio = if (totalSignals > 0) negativeSignals.toFloat() / totalSignals else 0f
+
+        var isHardBlocked = false
+        var isSoftBlocked = false
+        if (totalSignals >= 5) {
+            if (negativeRatio > 0.95f) isHardBlocked = true
+            else if (negativeRatio > 0.66f) isSoftBlocked = true
+        }
+
+        var revealOverride by remember { mutableStateOf(false) }
+        val isContentTransparencyEnabled by (viewModel?.isContentTransparencyEnabled ?: kotlinx.coroutines.flow.flowOf(false)).collectAsState(initial = false)
+        val showSoftBlockOverlay = isSoftBlocked && !revealOverride && !isContentTransparencyEnabled
+        val showTransparencyBadge = isSoftBlocked && isContentTransparencyEnabled
+
+        // NOSLOP_CLEARNET_SHARE_V1 — share to the mesh, or the original link to any app.
+        var showShareChoice by remember { mutableStateOf(false) }
+        val shareContext = LocalContext.current
+        if (showShareChoice) {
+            AlertDialog(
+                onDismissRequest = { showShareChoice = false },
+                containerColor = SurfaceDark,
+                title = { Text("Share".tr, color = TextLight, fontWeight = FontWeight.Bold) },
+                text = { Text("Share it with your mesh, or send its link to any app.".tr, color = TextMuted) },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showShareChoice = false
+                        item.url?.let { ClearnetShare.send(shareContext, item.title, it) }
+                    }) { Text("Share link".tr, color = AccentGreen) }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        showShareChoice = false
+                        onShareToMesh()
+                    }) { Text("Share to mesh".tr, color = TextLight) }
+                }
+            )
+        }
+
+        Box(modifier = Modifier.fillMaxSize()) {
+            OverlayInteractions(
+                isMesh = false,
+                showLike = true,
+                showComment = true,
+                isSaved = item.isSaved,
+                onToggleSave = { viewModel?.toggleItemSavedState(item.id, !item.isSaved) },
+                onLike = { viewModel?.reactToFeedItem(item, "like") },
+                onReaction = { type -> viewModel?.reactToFeedItem(item, type) },
+                onShare = { if (ClearnetShareText.canShare(item.url)) showShareChoice = true else onShareToMesh() },
+                onComment = { 
+                    viewModel?.bridgeFeedItemToMesh(item)
+                    viewModel?.openCommentsForPost(anchorId)
+                },
+                reactionSummary = (reactions.map { it.reactionType } + votes.map { it.voteType })
+                    .groupBy { it }.mapValues { it.value.size },
+                commentCount = comments.size,
+                netScore = upvotes - downvotes,
+                isBlocked = isHardBlocked,
+                isFlagged = isSoftBlocked,
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .graphicsLayer { 
+                        translationX = rightSlideOffset 
+                        alpha = if (rightSlideOffset > 0f) (1f - (rightSlideOffset / 300f)).coerceIn(0f, 1f) else 1f
+                    }
+            )
+
+            ContentHealthOverlay(
+                isBlocked = isHardBlocked,
+                isSoftBlocked = showSoftBlockOverlay,
+                onReveal = { revealOverride = true }
+            )
+
+            if (showTransparencyBadge && !isHardBlocked) {
+                Box(modifier = Modifier.fillMaxWidth().padding(top = 8.dp), contentAlignment = Alignment.TopCenter) {
+                    Row(
+                        modifier = Modifier.clip(RoundedCornerShape(16.dp)).background(Color.Black.copy(alpha = 0.6f)).padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.Warning, contentDescription = null, tint = Color.Yellow, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Community Flagged".tr, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun FullScreenMeshCardV2(
+    post: MeshPost,
+    isVisible: Boolean = true,
+    isNextSlide: Boolean = false,
+    onShareToMesh: () -> Unit,
+    onEditPost: ((MeshPost) -> Unit)? = null,
+    viewModel: NoSlopViewModel? = null,
+    bottomSlideOffset: Float = 0f,
+    rightSlideOffset: Float = 0f,
+    onNavigateToFilter: (String) -> Unit = {}
+) {
+    val context = LocalContext.current
+    val resolvedUrl = resolveMediaUrl(post.mediaUrl, context) ?: post.clearnetUrl
+    val effectiveMediaType = post.mediaType ?: post.clearnetMediaType
+    var showDeleteConfirm by remember { mutableStateOf(false) }
+
+    val displayHandle = remember(post.authorHandle, post.authorTripcode) {
+        if (post.authorHandle.endsWith(".${post.authorTripcode}")) {
+            post.authorHandle.removeSuffix(".${post.authorTripcode}")
+        } else post.authorHandle
+    }
+
+    val myPubKey = viewModel?.localKeys?.collectAsState()?.value?.publicKeyB64
+    val burnablePubKey = viewModel?.burnableKeys?.collectAsState()?.value?.publicKeyB64
+    val isMyPost = post.authorPublicKeyB64 == myPubKey || (burnablePubKey != null && post.authorPublicKeyB64 == burnablePubKey)
+    val allPeers by (viewModel?.peers ?: kotlinx.coroutines.flow.flowOf(emptyList())).collectAsState(initial = emptyList())
+    val resolveOriginOnion: () -> String? = {
+        val rawOrigin = post.mediaUrl?.substringAfter("noslop://")?.substringBefore("/") ?: ""
+        if (rawOrigin.endsWith(".onion")) {
+            rawOrigin
+        } else {
+            val authorPub = post.authorPublicKeyB64
+            if (authorPub.isNotBlank()) {
+                allPeers.find { it.publicKeyB64 == authorPub }?.onionAddress?.takeIf { it.endsWith(".onion") }
+            } else null
+        }
+    }
+
+    val rawMediaId = post.mediaUrl?.substringAfterLast("/")
+    var newlyDownloaded by remember { mutableStateOf(false) }
+    val isDownloaded = newlyDownloaded || (rawMediaId != null && com.noslop.app.mesh.MediaManager.isMediaDownloaded(rawMediaId, effectiveMediaType ?: "video"))
+
+    // Automatically trigger auto-download if enabled and not already running
+    LaunchedEffect(post.id, isDownloaded) {
+        if (!isDownloaded && rawMediaId != null && !com.noslop.app.mesh.MediaManager.isMediaDownloadingOrRecovering(rawMediaId)) {
+            val accurateMeta = com.noslop.app.mesh.MediaMetadata(
+                id = rawMediaId,
+                type = effectiveMediaType ?: "video",
+                mimeType = if (effectiveMediaType == "audio") "audio/mp4" else "video/mp4",
+                size = post.mediaSize,
+                chunkCount = if (post.mediaSize > 0) (post.mediaSize / (256 * 1024)).toInt() + 1 else 999
+            )
+            val origin = resolveOriginOnion()
+            com.noslop.app.mesh.MediaManager.checkAndAutoDownload(
+                accurateMeta,
+                "friends",
+                post.authorPublicKeyB64,
+                origin
+            )
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(PrimaryBlack)
+    ) {
+        if (resolvedUrl != null) {
+            when {
+                effectiveMediaType == "video" || 
+                resolvedUrl.contains(".mp4") || 
+                resolvedUrl.contains(".mkv") || 
+                resolvedUrl.contains(".m3u8") ||
+                resolvedUrl.contains("youtube") ||
+                resolvedUrl.contains("vimeo") ||
+                resolvedUrl.contains("archive.org/embed") -> {
+                    val canPlay = isDownloaded || post.clearnetUrl != null || post.mediaUrl == null
+                    val stableKeyForRestore = post.mediaUrl ?: post.clearnetUrl
+
+                    if (canPlay) {
+                        VideoPlayer(
+                            url = resolvedUrl,
+                            isVisible = isVisible,
+                            isNextSlide = isNextSlide,
+                            thumbnailUrl = post.clearnetThumbnailUrl,
+                            thumbnailB64 = if (post.mediaUrl != null) post.thumbnailB64 else null,
+                            stableKey = stableKeyForRestore,
+                            onPlaybackStarted = { viewModel?.markMeshMediaPlaybackStarted(post.id) }
+                        )
+                    } else {
+                        val downloadProgress by (viewModel?.downloadProgress?.collectAsState() ?: androidx.compose.runtime.mutableStateOf(emptyMap()))
+                        val progress = rawMediaId?.let { downloadProgress[it] } ?: 0
+
+                        LaunchedEffect(progress) {
+                            if (progress == 100) {
+                                newlyDownloaded = true
+                            }
+                        }
+
+                        if (isVisible) {
+                            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                BlurredImageBackground(url = post.clearnetThumbnailUrl ?: "", thumbnailB64 = post.thumbnailB64)
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(PrimaryBlack.copy(alpha=0.3f))
+                                        .clickable {
+                                            val accurateMeta = com.noslop.app.mesh.MediaMetadata(
+                                                id = rawMediaId ?: "",
+                                                type = effectiveMediaType ?: "video",
+                                                mimeType = "video/mp4",
+                                                size = post.mediaSize,
+                                                chunkCount = if (post.mediaSize > 0) (post.mediaSize / (256 * 1024)).toInt() + 1 else 999
+                                            )
+                                            val origin = resolveOriginOnion()
+                                            viewModel?.startMediaDownload(accurateMeta, origin)
+                                        }
+                                        .padding(16.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        Icon(Icons.Default.Download, contentDescription = "Download".tr, tint = AccentGreen, modifier = Modifier.size(48.dp))
+                                        val progressState = rawMediaId?.let { downloadProgress[it] }
+                                        if (progressState != null) {
+                                            Spacer(modifier = Modifier.height(8.dp))
+                                            if (progressState > 0) {
+                                                LinearProgressIndicator(progress = { progressState / 100f }, color = AccentGreen)
+                                                Text("Downloading {progress}%".tr.replace("{progress}", progressState.toString()), color = TextLight, fontSize = 12.sp)
+                                            } else {
+                                                LinearProgressIndicator(color = AccentGreen, modifier = Modifier.width(100.dp))
+                                                Text("Connecting & downloading...".tr, color = TextLight, fontSize = 12.sp)
+                                            }
+                                        } else {
+                                            Text("Tap to Download Video".tr, color = TextLight, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            BlurredImageBackground(url = post.clearnetThumbnailUrl ?: "", thumbnailB64 = post.thumbnailB64)
+                        }
+                    }
+                }
+                effectiveMediaType == "audio" || 
+                resolvedUrl.contains(".mp3") || 
+                resolvedUrl.contains(".wav") || 
+                resolvedUrl.contains(".m4a") || 
+                resolvedUrl.contains(".aac") || 
+                resolvedUrl.contains(".ogg") || 
+                resolvedUrl.contains(".flac") -> {
+                    val canPlay = isDownloaded || post.clearnetUrl != null || post.mediaUrl == null
+
+                    if (canPlay) {
+                        val stableKeyForRestore = post.mediaUrl ?: post.clearnetUrl
+                        AudioPlayer(
+                            url = resolvedUrl,
+                            isVisible = isVisible,
+                            stableKey = stableKeyForRestore,
+                            onPlaybackStarted = { viewModel?.markMeshMediaPlaybackStarted(post.id) }
+                        )
+                    } else {
+                        val downloadProgress by (viewModel?.downloadProgress?.collectAsState() ?: androidx.compose.runtime.mutableStateOf(emptyMap()))
+                        val progress = rawMediaId?.let { downloadProgress[it] } ?: 0
+
+                        LaunchedEffect(progress) {
+                            if (progress == 100) newlyDownloaded = true
+                        }
+
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            BlurredImageBackground(url = post.clearnetThumbnailUrl ?: "", thumbnailB64 = post.thumbnailB64)
+                            if (isVisible) {
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(PrimaryBlack.copy(alpha=0.3f))
+                                        .clickable {
+                                            val accurateMeta = com.noslop.app.mesh.MediaMetadata(
+                                                id = rawMediaId ?: "",
+                                                type = effectiveMediaType ?: "audio",
+                                                mimeType = "audio/mp4",
+                                                size = post.mediaSize,
+                                                chunkCount = if (post.mediaSize > 0) (post.mediaSize / (256 * 1024)).toInt() + 1 else 999
+                                            )
+                                            val origin = resolveOriginOnion()
+                                            viewModel?.startMediaDownload(accurateMeta, origin)
+                                        }
+                                        .padding(16.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        Icon(Icons.Default.Download, contentDescription = "Download".tr, tint = AccentGreen, modifier = Modifier.size(48.dp))
+                                        val progressState = rawMediaId?.let { downloadProgress[it] }
+                                        if (progressState != null) {
+                                            Spacer(modifier = Modifier.height(8.dp))
+                                            if (progressState > 0) {
+                                                LinearProgressIndicator(progress = { progressState / 100f }, color = AccentGreen)
+                                                Text("Downloading {progress}%".tr.replace("{progress}", progressState.toString()), color = TextLight, fontSize = 12.sp)
+                                            } else {
+                                                LinearProgressIndicator(color = AccentGreen, modifier = Modifier.width(100.dp))
+                                                Text("Connecting & downloading...".tr, color = TextLight, fontSize = 12.sp)
+                                            }
+                                        } else {
+                                            Text("Tap to Download Audio".tr, color = TextLight, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                effectiveMediaType == "image" || 
+                resolvedUrl.contains(".jpg") || 
+                resolvedUrl.contains(".jpeg") || 
+                resolvedUrl.contains(".png") || 
+                resolvedUrl.contains(".webp") || 
+                resolvedUrl.contains(".gif") -> {
+                    val canShow = isDownloaded || post.clearnetUrl != null || post.mediaUrl == null
+
+                    if (canShow) {
+                        val imageUrl = if (post.mediaUrl == null && post.clearnetThumbnailUrl != null) post.clearnetThumbnailUrl else resolvedUrl
+                        BlurredImageBackground(url = imageUrl ?: "", thumbnailB64 = post.thumbnailB64, fallbackUrl = post.clearnetThumbnailUrl)
+                        // An image or GIF is "played" once it is on screen. Without this the post was
+                        // never marked seen (only video reported playback) and kept returning in Mesh.
+                        if (isVisible) {
+                            LaunchedEffect(post.id) { viewModel?.markMeshMediaPlaybackStarted(post.id) }
+                        }
+                    } else {
+                        val downloadProgress by (viewModel?.downloadProgress?.collectAsState() ?: androidx.compose.runtime.mutableStateOf(emptyMap()))
+                        val progress = rawMediaId?.let { downloadProgress[it] } ?: 0
+
+                        LaunchedEffect(progress) {
+                            if (progress == 100) newlyDownloaded = true
+                        }
+
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            BlurredImageBackground(url = post.clearnetThumbnailUrl ?: "", thumbnailB64 = post.thumbnailB64)
+                            if (isVisible) {
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(PrimaryBlack.copy(alpha=0.3f))
+                                        .clickable {
+                                            val meta = com.noslop.app.mesh.MediaManager.getMetadataSync(rawMediaId ?: "")
+                                            if (meta != null) {
+                                                val origin = resolveOriginOnion()
+                                                viewModel?.startMediaDownload(meta, origin)
+                                            }
+                                        }
+                                        .padding(16.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        Icon(Icons.Default.Download, contentDescription = "Download".tr, tint = AccentGreen, modifier = Modifier.size(48.dp))
+                                        val isDownloading = rawMediaId != null && downloadProgress.containsKey(rawMediaId)
+                                        if (isDownloading) {
+                                            Spacer(modifier = Modifier.height(8.dp))
+                                            if (progress > 0) {
+                                                LinearProgressIndicator(progress = { progress / 100f }, color = AccentGreen)
+                                                Text("Downloading $progress%", color = TextLight, fontSize = 12.sp)
+                                            } else {
+                                                LinearProgressIndicator(color = AccentGreen, modifier = Modifier.width(100.dp))
+                                                Text("Connecting & downloading...".tr, color = TextLight, fontSize = 12.sp)
+                                            }
+                                        } else {
+                                            Text("Tap to Download Image".tr, color = TextLight, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                effectiveMediaType == "file" -> {
+                    val rawMediaId = post.mediaUrl?.substringAfterLast("/")
+                    val isDownloaded = rawMediaId != null && com.noslop.app.mesh.MediaManager.isMediaDownloaded(rawMediaId, "file")
+                    val downloadProgress by (viewModel?.downloadProgress?.collectAsState() ?: androidx.compose.runtime.mutableStateOf(emptyMap()))
+                    val progress = rawMediaId?.let { downloadProgress[it] } ?: 0
+                    val isDownloading = rawMediaId != null && downloadProgress.containsKey(rawMediaId)
+
+                    Box(modifier = Modifier.fillMaxSize().padding(bottom = 120.dp), contentAlignment = Alignment.Center) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(SurfaceDark.copy(alpha = 0.9f))
+                                .border(1.dp, BorderSubtle, RoundedCornerShape(16.dp))
+                                .padding(32.dp)
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.InsertDriveFile, contentDescription = "File".tr, tint = AccentGreen, modifier = Modifier.size(64.dp))
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(post.clearnetTitle ?: "Attached File", color = TextLight, fontWeight = FontWeight.Bold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Spacer(modifier = Modifier.height(16.dp))
+                            
+                            if (isDownloaded) {
+                                Button(
+                                    onClick = {
+                                        if (rawMediaId != null) {
+                                            val meta = com.noslop.app.mesh.MediaManager.getMetadataSync(rawMediaId)
+                                            val saved = com.noslop.app.mesh.MediaManager.exportToPublicDownloads(context, rawMediaId, meta?.filename ?: post.clearnetTitle ?: rawMediaId)
+                                            if (saved) Toast.makeText(context, com.noslop.app.util.LanguageManager.translate("Saved to Downloads"), Toast.LENGTH_SHORT).show()
+                                            else Toast.makeText(context, com.noslop.app.util.LanguageManager.translate("Failed to save file"), Toast.LENGTH_SHORT).show()
+                                        }
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = PrimaryBlack)
+                                ) {
+                                    Text("Save to Device".tr, fontWeight = FontWeight.Bold)
+                                }
+                            } else if (isDownloading) {
+                                LinearProgressIndicator(progress = { progress / 100f }, color = AccentGreen, modifier = Modifier.width(120.dp))
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(if (progress > 0) "Downloading $progress%" else "Connecting...", color = TextMuted, fontSize = 12.sp)
+                            } else {
+                                OutlinedButton(
+                                    onClick = {
+                                        if (rawMediaId != null) {
+                                            val meta = com.noslop.app.mesh.MediaManager.getMetadataSync(rawMediaId)
+                                            if (meta != null) {
+                                                val origin = resolveOriginOnion()
+                                                viewModel?.startMediaDownload(meta, origin)
+                                            }
+                                        }
+                                    },
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentGreen), 
+                                    border = BorderStroke(1.dp, AccentGreen)
+                                ) {
+                                    Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text("Download File".tr, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+                }
+                else -> {
+                    SegmentedArticleReader(
+                        content = post.content,
+                        title = post.clearnetTitle ?: post.content.take(60).trimEnd().let { if (it.length == 60) "$it…" else it },
+                        author = post.authorHandle,
+                        sourceLabel = if (post.clearnetUrl != null) "Shared by ${post.authorHandle}" else "MESH",
+                        thumbnailUrl = post.clearnetThumbnailUrl ?: resolvedUrl,
+                        articleUrl = post.clearnetUrl,
+                        publishedAt = post.timestamp
+                    )
+                }
+            }
+        } else {
+            SegmentedArticleReader(
+                content = post.content,
+                title = post.clearnetTitle ?: post.content.take(60).trimEnd().let { if (it.length == 60) "$it…" else it },
+                author = displayHandle,
+                sourceLabel = if (post.clearnetUrl != null) "Shared by $displayHandle" else "MESH",
+                thumbnailUrl = post.clearnetThumbnailUrl,
+                articleUrl = post.clearnetUrl,
+                publishedAt = post.timestamp
+            )
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.BottomStart)
+                .graphicsLayer { 
+                    translationY = bottomSlideOffset 
+                    alpha = if (bottomSlideOffset > 0f) (1f - (bottomSlideOffset / 300f)).coerceIn(0f, 1f) else 1f
+                }
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(Color.Transparent, PrimaryBlack.copy(alpha = 0.85f))
+                    )
+                )
+                .padding(horizontal = 24.dp, vertical = 32.dp)
+        ) {
+            Column(
+                modifier = Modifier.fillMaxWidth(0.8f)
+            ) {
+                var showUserInfoDialog by remember { mutableStateOf(false) }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.clickable { showUserInfoDialog = true }
+                ) {
+                    if (post.authorAvatarB64 != null) {
+                        val bitmap = remember(post.authorAvatarB64) {
+                            try {
+                                val bytes = android.util.Base64.decode(post.authorAvatarB64, android.util.Base64.DEFAULT)
+                                android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+                            } catch (e: Exception) { null }
+                        }
+                        if (bitmap != null) {
+                            androidx.compose.foundation.Image(
+                                bitmap = bitmap,
+                                contentDescription = "Avatar".tr,
+                                modifier = Modifier.size(24.dp).clip(CircleShape),
+                                contentScale = ContentScale.Crop
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                        }
+                    }
+                    Text(displayHandle, color = AccentGreen, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace, fontSize = 14.sp)
+                    // D08/D10: media the author's signature does not cover can't be checked after download.
+                    if (post.mediaUrl != null && !isMyPost && viewModel != null) {
+                        val mediaVerified by produceState(initialValue = true, post.id, post.signature) {
+                            value = viewModel.isMeshPostMediaVerified(post)
+                        }
+                        if (!mediaVerified) {
+                            Spacer(modifier = Modifier.width(8.dp))
+                            UnverifiedMediaChip()
+                        }
+                    }
+
+                }
+
+                if (showUserInfoDialog) {
+                    val allPeers by (viewModel?.peers ?: kotlinx.coroutines.flow.flowOf(emptyList())).collectAsState(initial = emptyList())
+                    val discPeers by (viewModel?.discoverablePeers ?: kotlinx.coroutines.flow.flowOf(emptyList())).collectAsState(initial = emptyList())
+                    val peer = allPeers.find { it.publicKeyB64 == post.authorPublicKeyB64 }
+                    val discPeer = discPeers.find { it.publicKeyB64 == post.authorPublicKeyB64 }
+                    val isTrusted = peer?.isTrusted == true
+                    val isSelf = isMyPost
+                    val isCreator = peer?.isCreator == true || discPeer?.isCreator == true || post.authorPublicKeyB64 == com.noslop.app.data.NoSlopRepository.OFFICIAL_CREATOR_PUBKEY
+                    val effectiveDonationUrl = if (post.authorPublicKeyB64 == com.noslop.app.data.NoSlopRepository.OFFICIAL_CREATOR_PUBKEY) {
+                        peer?.fundMeLink?.takeIf { it.isNotBlank() } ?: discPeer?.fundMeLink?.takeIf { it.isNotBlank() } ?: "https://donate.stripe.com/dRmfZae1F0jNfPNfFC9fW00"
+                    } else {
+                        peer?.fundMeLink?.takeIf { it.isNotBlank() } ?: discPeer?.fundMeLink?.takeIf { it.isNotBlank() }
+                    }
+                    var activeDonationUrl by remember { mutableStateOf<String?>(null) }
+                    var showConnectWarning by remember { mutableStateOf(false) }
+                    
+                    val targetOnion = discPeer?.onionAddress ?: peer?.onionAddress
+                    val targetEncPub = discPeer?.encPublicKeyB64 ?: peer?.encPublicKeyB64 ?: ""
+
+                    val userSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+                    ModalBottomSheet(
+                        onDismissRequest = { showUserInfoDialog = false },
+                        sheetState = userSheetState,
+                        containerColor = SurfaceDark,
+                        dragHandle = { BottomSheetDefaults.DragHandle(color = TextMuted) }
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .verticalScroll(rememberScrollState())
+                                .padding(horizontal = 20.dp)
+                                .padding(bottom = 32.dp)
+                        ) {
+                            Text("User Profile".tr, color = AccentGreen, fontWeight = FontWeight.Bold, fontSize = 18.sp, modifier = Modifier.padding(bottom = 12.dp))
+                            Box(modifier = Modifier.size(80.dp), contentAlignment = Alignment.Center) {
+                                if (post.authorAvatarB64 != null) {
+                                    val bitmap = remember(post.authorAvatarB64) {
+                                        try {
+                                            val bytes = android.util.Base64.decode(post.authorAvatarB64, android.util.Base64.DEFAULT)
+                                            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+                                        } catch (e: Exception) { null }
+                                    }
+                                    if (bitmap != null) {
+                                        androidx.compose.foundation.Image(
+                                            bitmap = bitmap,
+                                            contentDescription = "Avatar".tr,
+                                            modifier = Modifier.size(80.dp).clip(CircleShape),
+                                            contentScale = ContentScale.Crop
+                                        )
+                                    } else {
+                                        Box(modifier = Modifier.size(80.dp).clip(CircleShape).background(PrimaryBlack), contentAlignment = Alignment.Center) {
+                                            Text(displayHandle.take(1).uppercase(), color = AccentGreen, fontWeight = FontWeight.Bold, fontSize = 28.sp)
+                                        }
+                                    }
+                                } else {
+                                    Box(modifier = Modifier.size(80.dp).clip(CircleShape).background(PrimaryBlack), contentAlignment = Alignment.Center) {
+                                        Text(displayHandle.take(1).uppercase(), color = AccentGreen, fontWeight = FontWeight.Bold, fontSize = 28.sp)
+                                    }
+                                }
+
+                                if (isCreator && effectiveDonationUrl != null) {
+                                    Surface(
+                                        shape = CircleShape,
+                                        color = AccentGreen,
+                                        border = BorderStroke(2.dp, SurfaceDark),
+                                        modifier = Modifier
+                                            .align(Alignment.TopEnd)
+                                            .offset(x = 4.dp, y = (-4).dp)
+                                            .size(26.dp)
+                                            .clickable { activeDonationUrl = effectiveDonationUrl }
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) {
+                                            Text("$", color = PrimaryBlack, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                        }
+                                    }
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(16.dp))
+                            
+                            val tripcode = peer?.tripcode ?: discPeer?.tripcode ?: post.authorTripcode
+                            val fullName = if (tripcode.isNotBlank()) "${displayHandle}.${tripcode}" else displayHandle
+                            Text(if (isTrusted || isSelf) fullName else displayHandle, color = TextLight, fontSize = 20.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace)
+                            
+                            val bio = peer?.bio ?: discPeer?.bio
+                            if (!bio.isNullOrBlank()) {
+                                Spacer(modifier = Modifier.height(12.dp))
+                                Text(bio, color = TextMuted, fontSize = 14.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                            }
+
+                            if (isCreator) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text("Creator Node".tr, color = AccentGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                    if (effectiveDonationUrl != null) {
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Surface(
+                                            shape = CircleShape,
+                                            color = AccentGreen.copy(alpha = 0.2f),
+                                            border = BorderStroke(1.dp, AccentGreen),
+                                            modifier = Modifier
+                                                .size(20.dp)
+                                                .clickable { activeDonationUrl = effectiveDonationUrl }
+                                        ) {
+                                            Box(contentAlignment = Alignment.Center) {
+                                                Text("$", color = AccentGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (activeDonationUrl != null) {
+                                com.noslop.app.ui.ArticleWebViewDialog(
+                                    url = activeDonationUrl!!,
+                                    title = "${"Support".tr} $displayHandle",
+                                    onDismiss = { activeDonationUrl = null }
+                                )
+                            }
+
+                            if (isTrusted && peer?.isTemporary == true) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Box(
+                                    modifier = Modifier.clip(RoundedCornerShape(4.dp)).background(TemporaryAmber.copy(alpha = 0.2f)).padding(horizontal = 8.dp, vertical = 4.dp)
+                                ) {
+                                    Text("Temporary Contact".tr, color = TemporaryAmber, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                }
+                            } else if (isTrusted) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Box(
+                                    modifier = Modifier.clip(RoundedCornerShape(4.dp)).background(AccentGreen.copy(alpha = 0.2f)).padding(horizontal = 8.dp, vertical = 4.dp)
+                                ) {
+                                    Text("Connected Peer".tr, color = AccentGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+
+                            if (!isTrusted && !isSelf && targetOnion != null && targetOnion.isNotBlank()) {
+                                Spacer(modifier = Modifier.height(16.dp))
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(PrimaryBlack)
+                                        .padding(12.dp)
+                                ) {
+                                    Text(
+                                        text = "ONION ADDRESS".tr,
+                                        color = TextMuted,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        letterSpacing = 1.sp
+                                    )
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = if (targetOnion.length > 8) targetOnion.take(8) + "..." else targetOnion,
+                                        color = TextLight.copy(alpha = 0.7f),
+                                        fontFamily = FontFamily.Monospace,
+                                        fontSize = 11.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+
+                            val authorPosts by (viewModel?.meshPosts?.collectAsState(initial = emptyList()) ?: mutableStateOf(emptyList()))
+                            val userPosts = remember(authorPosts, post.authorPublicKeyB64) {
+                                authorPosts.filter { it.authorPublicKeyB64 == post.authorPublicKeyB64 && !it.isOrphaned }
+                            }
+                            if (userPosts.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(16.dp))
+                                PeerMeshContentList(
+                                    posts = userPosts,
+                                    onPostClick = { clickedPost ->
+                                        showUserInfoDialog = false
+                                        viewModel?.viewAuthorPosts(post.authorPublicKeyB64, clickedPost.id)
+                                    }
+                                )
+                            }
+
+
+                            if (!isSelf && !isTrusted && targetOnion != null) {
+                                Spacer(modifier = Modifier.height(24.dp))
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                                    Button(
+                                        onClick = { showConnectWarning = true },
+                                        colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = PrimaryBlack),
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Icon(Icons.Default.PersonAdd, contentDescription = null, modifier = Modifier.size(18.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text("Connect".tr, fontWeight = FontWeight.Bold)
+                                    }
+                                    Button(
+                                        onClick = {
+                                            viewModel?.banNode(post.authorPublicKeyB64, displayHandle)
+                                            showUserInfoDialog = false
+                                        },
+                                        colors = ButtonDefaults.buttonColors(containerColor = DestructiveRed.copy(alpha = 0.2f), contentColor = DestructiveRed),
+                                        border = BorderStroke(1.dp, DestructiveRed),
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Text("Ban Node 🚫".tr, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            } else if (!isSelf) {
+                                Spacer(modifier = Modifier.height(16.dp))
+                                Button(
+                                    onClick = {
+                                        viewModel?.banNode(post.authorPublicKeyB64, displayHandle)
+                                        showUserInfoDialog = false
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = DestructiveRed.copy(alpha = 0.2f), contentColor = DestructiveRed),
+                                    border = BorderStroke(1.dp, DestructiveRed),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text("Ban Node 🚫".tr, fontWeight = FontWeight.Bold)
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Button(
+                                onClick = { showUserInfoDialog = false },
+                                colors = ButtonDefaults.buttonColors(containerColor = SurfaceDark, contentColor = TextLight),
+                                border = BorderStroke(1.dp, BorderSubtle),
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("Close".tr, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+
+                    if (showConnectWarning && targetOnion != null) {
+                        AlertDialog(
+                            onDismissRequest = { showConnectWarning = false },
+                            title = { Text("Connect to Unknown Node".tr, color = DestructiveRed, fontWeight = FontWeight.Bold) },
+                            text = { Text("You are about to request a connection with an unknown node on the mesh. This will expose your burnable onion address to them. Proceed with caution.".tr, color = TextLight) },
+                            confirmButton = {
+                                Button(
+                                    onClick = {
+                                        viewModel?.requestConnection(
+                                            handle = displayHandle,
+                                            publicKeyB64 = post.authorPublicKeyB64,
+                                            onionAddress = targetOnion,
+                                            encPublicKeyB64 = targetEncPub,
+                                            useBurnableIdentity = true
+                                        )
+                                        showConnectWarning = false
+                                        showUserInfoDialog = false
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = DestructiveRed, contentColor = Color.White)
+                                ) {
+                                    Text("Connect".tr, fontWeight = FontWeight.Bold)
+                                }
+                            },
+                            dismissButton = {
+                                TextButton(onClick = { showConnectWarning = false }) { Text("Cancel".tr, color = TextMuted) }
+                            },
+                            containerColor = SurfaceDark
+                        )
+                    }
+                }
+                
+                if (post.content.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    var isExpanded by remember(post.id) { mutableStateOf(false) }
+                    val annotatedContent = remember(post.content) { com.noslop.app.util.MarkdownUtils.parseMarkdown(post.content) }
+                    val isLongText = post.content.lines().size > 2 || post.content.length > 120
+                    val textScrollState = androidx.compose.foundation.rememberScrollState()
+
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(
+                                if (isExpanded) {
+                                    Modifier
+                                        .heightIn(max = 240.dp)
+                                        .background(Color.Black.copy(alpha = 0.65f), shape = RoundedCornerShape(8.dp))
+                                        .padding(8.dp)
+                                        .clickable { isExpanded = false }
+                                } else {
+                                    Modifier
+                                }
+                            )
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f, fill = false)
+                                .then(if (isExpanded) Modifier.verticalScroll(textScrollState) else Modifier)
+                        ) {
+                            Text(
+                                text = annotatedContent,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = TextLight,
+                                maxLines = if (isExpanded) Int.MAX_VALUE else 2,
+                                overflow = if (isExpanded) androidx.compose.ui.text.style.TextOverflow.Clip else androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                        if (isLongText) {
+                            Text(
+                                text = if (isExpanded) "show less ▲".tr else "read more... ▼".tr,
+                                style = MaterialTheme.typography.bodySmall.copy(fontWeight = androidx.compose.ui.text.font.FontWeight.Bold),
+                                color = AccentGreen,
+                                modifier = Modifier
+                                    .clickable { isExpanded = !isExpanded }
+                                    .padding(top = 4.dp, bottom = 4.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        val reactions by (viewModel?.getReactionsForPost(post.id) ?: emptyFlow()).collectAsState(initial = emptyList())
+        val votes by (viewModel?.getVotesForPost(post.id) ?: emptyFlow()).collectAsState(initial = emptyList())
+        val comments by (viewModel?.getCommentsForPost(post.id) ?: emptyFlow()).collectAsState(initial = emptyList())
+
+        val upvotes = votes.count { it.voteType == "upvote" }
+        val downvotes = votes.count { it.voteType == "downvote" }
+        val explicitNegativeReactions = reactions.count { it.reactionType in setOf("downvote", "slop", "vomit", "clown", "noslop") }
+        val totalSignals = reactions.size + votes.size
+        val negativeSignals = downvotes + explicitNegativeReactions
+        val negativeRatio = if (totalSignals > 0) negativeSignals.toFloat() / totalSignals else 0f
+
+        var isHardBlocked = false
+        var isSoftBlocked = false
+        if (totalSignals >= 5) {
+            if (negativeRatio > 0.95f) isHardBlocked = true
+            else if (negativeRatio > 0.66f) isSoftBlocked = true
+        }
+
+        var revealOverride by remember { mutableStateOf(false) }
+        val isContentTransparencyEnabled by (viewModel?.isContentTransparencyEnabled ?: kotlinx.coroutines.flow.flowOf(false)).collectAsState(initial = false)
+        val showSoftBlockOverlay = isSoftBlocked && !revealOverride && !isContentTransparencyEnabled
+        val showTransparencyBadge = isSoftBlocked && isContentTransparencyEnabled
+
+        Box(modifier = Modifier.fillMaxSize()) {
+            OverlayInteractions(
+                isMesh = true,
+                showLike = true,
+                showComment = true,
+                onLike = { viewModel?.reactToMeshPost(post.id, "like") },
+                onReaction = { type -> viewModel?.reactToMeshPost(post.id, type) },
+                onShare = if (post.privacy == "friends") null else onShareToMesh,
+                onComment = { viewModel?.openCommentsForPost(post.id) },
+                reactionSummary = (reactions.map { it.reactionType } + votes.map { it.voteType })
+                    .groupBy { it }.mapValues { it.value.size },
+                commentCount = comments.size,
+                netScore = upvotes - downvotes,
+                isBlocked = isHardBlocked,
+                isFlagged = isSoftBlocked,
+                onEdit = if (isMyPost && onEditPost != null) { { onEditPost(post) } } else null,
+                onDelete = if (isMyPost) { { showDeleteConfirm = true } } else null,
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .graphicsLayer { 
+                        translationX = rightSlideOffset 
+                        alpha = if (rightSlideOffset > 0f) (1f - (rightSlideOffset / 300f)).coerceIn(0f, 1f) else 1f
+                    }
+            )
+
+            ContentHealthOverlay(
+                isBlocked = isHardBlocked,
+                isSoftBlocked = showSoftBlockOverlay,
+                onReveal = { revealOverride = true }
+            )
+
+            if (showTransparencyBadge && !isHardBlocked) {
+                Box(modifier = Modifier.fillMaxWidth().padding(top = 8.dp), contentAlignment = Alignment.TopCenter) {
+                    Row(
+                        modifier = Modifier.clip(RoundedCornerShape(16.dp)).background(Color.Black.copy(alpha = 0.6f)).padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.Warning, contentDescription = null, tint = Color.Yellow, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Community Flagged".tr, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+
+        if (showDeleteConfirm) {
+            AlertDialog(
+                onDismissRequest = { showDeleteConfirm = false },
+                title = { Text("Delete Broadcast".tr, color = TextLight, fontWeight = FontWeight.Bold) },
+                text = { Text("This will permanently delete this post from your device and broadcast a deletion signal to the mesh. This action cannot be undone.".tr, color = TextMuted) },
+                confirmButton = {
+                    Button(
+                        onClick = { 
+                            viewModel?.deleteMeshPost(post.id)
+                            showDeleteConfirm = false 
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = DestructiveRed)
+                    ) { Text("Delete".tr, color = Color.White, fontWeight = FontWeight.Bold) }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showDeleteConfirm = false }) { Text("Cancel".tr, color = AccentGreen) }
+                },
+                containerColor = SurfaceDark
+            )
+        }
+    }
+}
+
+/** D08/D10: marks mesh media whose file can't be checked against what the author signed. */
+@Composable
+private fun UnverifiedMediaChip() {
+    var showInfo by remember { mutableStateOf(false) }
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(4.dp))
+            .background(TemporaryAmber.copy(alpha = 0.2f))
+            .clickable { showInfo = true }
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(Icons.Default.Warning, contentDescription = null, tint = TemporaryAmber, modifier = Modifier.size(12.dp))
+        Spacer(modifier = Modifier.width(4.dp))
+        Text("Unverified media".tr, color = TemporaryAmber, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+    }
+    if (showInfo) {
+        AlertDialog(
+            onDismissRequest = { showInfo = false },
+            containerColor = SurfaceDark,
+            title = { Text("Unverified media".tr, color = TextLight, fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "The author's signature on this post does not cover its media file, so the downloaded file cannot be checked against what they posted. It may have been replaced on the way.".tr,
+                    color = TextMuted
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { showInfo = false }) { Text("OK".tr, color = AccentGreen) }
+            }
+        )
+    }
+}

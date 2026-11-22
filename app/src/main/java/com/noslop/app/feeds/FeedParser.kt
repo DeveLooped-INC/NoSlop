@@ -1,0 +1,500 @@
+// FILE: app/src/main/java/com/noslop/app/feeds/FeedParser.kt
+package com.noslop.app.feeds
+
+import android.util.Xml
+import com.noslop.app.data.FeedItem
+import com.noslop.app.debug.Logger
+import org.xmlpull.v1.XmlPullParser
+import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
+
+object FeedParser {
+
+    private const val TAG = "FEED_PARSER"
+
+    private val dateFormats = listOf(
+        SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US),
+        SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss Z", Locale.US),
+        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") },
+        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") },
+        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US),
+        SimpleDateFormat("yyyy-MM-dd", Locale.US)
+    )
+
+    fun parseDate(dateStr: String?): Long {
+        if (dateStr.isNullOrBlank()) return System.currentTimeMillis()
+        val cleaned = dateStr.trim()
+        for (df in dateFormats) {
+            try {
+                return df.parse(cleaned)?.time ?: continue
+            } catch (e: Exception) {
+                // Try next
+            }
+        }
+        return System.currentTimeMillis() // Fallback
+    }
+
+    /**
+     * Performs an HTTP GET request to fetch feed content, then parses the stream.
+     */
+    fun fetchAndParse(feedUrl: String, sourceId: String): List<FeedItem> {
+        return try {
+            Logger.info(TAG, "Fetching feed contents from: $feedUrl")
+            // NOSLOP_HONEST_USER_AGENT_V1 — NoSlop names itself. A site that refuses that gets one retry
+            // as a browser, and is remembered for this run. Reddit RSS stays as it was (owner, 2026-11-12).
+            val host = com.noslop.app.net.NoSlopUserAgent.hostOf(feedUrl)
+            val asBrowser = isRedditFeedUrl(feedUrl) || com.noslop.app.net.NoSlopUserAgent.needsBrowser(host)
+            var response = fetchFeed(feedUrl, if (asBrowser) com.noslop.app.net.NoSlopUserAgent.BROWSER else com.noslop.app.net.NoSlopUserAgent.value)
+            if (!asBrowser && com.noslop.app.net.NoSlopUserAgent.shouldRetryAsBrowser(response.code)) {
+                Logger.warn(TAG, "$host refused NoSlop's User-Agent (HTTP ${response.code}); retrying as a browser")
+                response.close()
+                com.noslop.app.net.NoSlopUserAgent.rememberNeedsBrowser(host)
+                response = fetchFeed(feedUrl, com.noslop.app.net.NoSlopUserAgent.BROWSER)
+            }
+
+            response.use { response ->
+                if (response.isSuccessful && response.body != null) {
+                    Logger.info(TAG, "Successfully fetched feed: $feedUrl (HTTP ${response.code})")
+                    if (isRedditFeedUrl(feedUrl)) {
+                        // NOSLOP_FEED_TYPES_V1 — the same posts reach the Reddit API categories, read by
+                        // RedditApiClient. One parser keeps one id per post, and one set of rules.
+                        val page = com.noslop.app.feeds.api.RedditApiClient.parseRssListing(response.body!!.string(), sourceId)
+                        if (page == null) Logger.warn(TAG, "Reddit feed for $sourceId was not a feed")
+                        page?.items ?: emptyList()
+                    } else {
+                        response.body!!.byteStream().use { stream ->
+                            parseStream(stream, sourceId, feedUrl)
+                        }
+                    }
+                } else {
+                    Logger.warn(TAG, "Server returned HTTP ${response.code} for $feedUrl. Response: ${response.message}")
+                    emptyList()
+                }
+            }
+        } catch (e: Exception) {
+            Logger.error(TAG, "Network exception fetching feed $feedUrl: ${e.message}")
+            emptyList()
+        }
+    }
+
+    private fun fetchFeed(feedUrl: String, userAgent: String): okhttp3.Response =
+        com.noslop.app.net.HttpClientProvider.activeClearnetClient.newCall(
+            okhttp3.Request.Builder().url(feedUrl).header("User-Agent", userAgent).build()
+        ).execute()
+
+    /**
+     * Parse feed inputs using Android XmlPullParser (handling RSS & Atom formats)
+     */
+    fun parseStream(stream: InputStream, sourceId: String, feedUrl: String? = null): List<FeedItem> {
+        val list = mutableListOf<FeedItem>()
+        try {
+            val parser = Xml.newPullParser()
+            parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false)
+            parser.setInput(stream, null)
+
+            var eventType = parser.eventType
+            var isAtom = false
+            val photoStream = isPhotoStreamFeed(sourceId, feedUrl) // NOSLOP_FEED_TYPES_V1
+
+            while (eventType != XmlPullParser.END_DOCUMENT) {
+                val name = parser.name
+                if (eventType == XmlPullParser.START_TAG) {
+                    if (name.equals("feed", ignoreCase = true)) {
+                        isAtom = true
+                    } else if (name.equals("item", ignoreCase = true) && !isAtom) {
+                        list.add(parseRssItem(parser, sourceId, photoStream))
+                    } else if (name.equals("entry", ignoreCase = true) && isAtom) {
+                        list.add(parseAtomEntry(parser, sourceId, photoStream))
+                    }
+                }
+                eventType = parser.next()
+            }
+        } catch (e: Exception) {
+            val source = feedUrl ?: sourceId
+            Logger.error(TAG, "Error parsing XML stream for $source", e.message)
+        }
+        return list
+    }
+
+    /**
+     * Identifies content type based on URL patterns and provided MIME types.
+     * Robust: Detects common video platforms even if explicit metadata is missing.
+     */
+    private fun getMediaType(url: String, mimeType: String?): String? {
+        val type = mimeType?.lowercase(Locale.US) ?: ""
+        val lowerUrl = url.lowercase(Locale.US)
+        val urlNoQuery = lowerUrl.substringBefore("?")
+        
+        return when {
+            // 1. Explicit Video MIME or known extension
+            type.contains("video") || 
+            urlNoQuery.endsWith(".mp4") || urlNoQuery.endsWith(".mkv") || 
+            urlNoQuery.endsWith(".webm") || urlNoQuery.endsWith(".mov") || 
+            urlNoQuery.endsWith(".m3u8") -> "video"
+
+            // 2. Video platform patterns (for feeds that omit MIME types)
+            lowerUrl.contains("youtube.com/embed") || lowerUrl.contains("youtu.be/") ||
+            lowerUrl.contains("vimeo.com/") || lowerUrl.contains("archive.org/embed") -> "video"
+
+            // 3. Audio patterns
+            type.contains("audio") || 
+            urlNoQuery.endsWith(".mp3") || urlNoQuery.endsWith(".wav") || 
+            urlNoQuery.endsWith(".m4a") || urlNoQuery.endsWith(".aac") || 
+            urlNoQuery.endsWith(".ogg") || urlNoQuery.endsWith(".flac") -> "audio"
+
+            // 4. Image patterns
+            type.contains("image") || 
+            urlNoQuery.endsWith(".jpg") || urlNoQuery.endsWith(".jpeg") || 
+            urlNoQuery.endsWith(".png") || urlNoQuery.endsWith(".webp") || 
+            urlNoQuery.endsWith(".gif") -> "image"
+
+            else -> null
+        }
+    }
+
+    private fun parseRssItem(parser: XmlPullParser, sourceId: String, photoStream: Boolean = false): FeedItem {
+        var title = ""
+        var link = ""
+        var author: String? = null
+        var description = ""
+        var pubDateStr = ""
+        var guid = ""
+        var mediaUrl: String? = null
+        var mediaType: String? = null
+        var thumbnailUrl: String? = null
+        val photoTags = mutableListOf<String>() // NOSLOP_FLICKR_INTERESTS_V1
+
+        var eventType = parser.next()
+        while (!(eventType == XmlPullParser.END_TAG && parser.name.equals("item", ignoreCase = true))) {
+            if (eventType == XmlPullParser.START_TAG) {
+                val name = parser.name
+                when (name.lowercase(Locale.US)) {
+                    "title" -> title = readText(parser)
+                    "link" -> link = readText(parser)
+                    "description", "content:encoded", "encoded" -> {
+                        val raw = readText(parser)
+                        if (raw.length > description.length) description = raw
+                    }
+                    "pubdate" -> pubDateStr = readText(parser)
+                    "guid" -> guid = readText(parser)
+                    "creator", "author" -> author = readText(parser)
+                    "enclosure", "media:content" -> {
+                        val encUrl = parser.getAttributeValue(null, "url")
+                        val encType = parser.getAttributeValue(null, "type")
+                        if (!encUrl.isNullOrBlank()) {
+                            val derivedType = getMediaType(encUrl, encType)
+                            if (derivedType == "image") {
+                                if (thumbnailUrl == null) thumbnailUrl = encUrl
+                                // NOSLOP_FEED_TYPES_V1 — in a photo stream the image is the item itself.
+                                if (photoStream && mediaUrl == null) {
+                                    mediaUrl = encUrl
+                                    mediaType = "image"
+                                }
+                            } else if (photoStream && derivedType == "video") {
+                                // NOSLOP_FLICKR_INTERESTS_V1 — Flickr serves its videos only to signed-in
+                                // sessions, so they never play; the item stays a photo.
+                            } else {
+                                mediaUrl = encUrl
+                                mediaType = derivedType
+                            }
+                        }
+                        skip(parser)
+                    }
+                    "media:thumbnail" -> {
+                        val thumbUrl = parser.getAttributeValue(null, "url")
+                        if (!thumbUrl.isNullOrBlank()) {
+                            thumbnailUrl = thumbUrl
+                        }
+                        skip(parser)
+                    }
+                    "media:group" -> {
+                        // YouTube style
+                        val groupResult = parseMediaGroup(parser)
+                        if (groupResult.first != null) {
+                            if (mediaUrl == null) {
+                                mediaUrl = groupResult.first
+                                mediaType = groupResult.second
+                            }
+                            thumbnailUrl = groupResult.first // Use video URL as thumb fallback or thumbnail from group
+                        }
+                    }
+                    "media:category", "category" -> {
+                        // NOSLOP_FLICKR_INTERESTS_V1 — a photo's tags, kept for search and filtering.
+                        if (photoStream) photoTags += readText(parser).trim() else skip(parser)
+                    }
+                    else -> skip(parser)
+                }
+            }
+            eventType = parser.next()
+        }
+
+        // Clean up formatting
+        var cleanedDesc = stripHtml(description).take(600)
+        if (cleanedDesc.trim().equals("Comments", ignoreCase = true) || cleanedDesc.trim().equals("Comment", ignoreCase = true)) {
+            cleanedDesc = ""
+            description = ""
+        }
+        val tagLine = photoTags.filter { it.isNotEmpty() }.joinToString(" ").take(300)
+        if (tagLine.isNotEmpty()) cleanedDesc = (if (cleanedDesc.isBlank()) "" else "$cleanedDesc\n") + "Tags: $tagLine"
+        if (photoStream && mediaUrl == null && thumbnailUrl != null) {
+            // A photo stream item whose only media was a video: show its still.
+            mediaUrl = thumbnailUrl
+            mediaType = "image"
+        }
+        val id = guid.ifBlank { link.ifBlank { title + pubDateStr } }
+
+        if (mediaUrl == null && thumbnailUrl == null) {
+            // Extract embedded images for thumbnail display only.
+            // Do NOT promote to mediaType="image" — RSS articles with images are still articles.
+            val embeddedImage = extractFirstImage(description)
+            if (embeddedImage != null) {
+                thumbnailUrl = embeddedImage
+            }
+        }
+
+        return FeedItem(
+            id = "rss_${sourceId}_${id.hashCode()}",
+            sourceId = sourceId,
+            title = title,
+            url = link,
+            author = author,
+            excerpt = cleanedDesc,
+            publishedAt = parseDate(pubDateStr),
+            fullContent = description,
+            mediaUrl = mediaUrl,
+            mediaType = mediaType,
+            thumbnailUrl = thumbnailUrl
+        )
+    }
+
+    private fun parseAtomEntry(parser: XmlPullParser, sourceId: String, photoStream: Boolean = false): FeedItem {
+        var title = ""
+        var link = ""
+        var authorStr: String? = null
+        var summary = ""
+        var updatedStr = ""
+        var idStr = ""
+        var mediaUrl: String? = null
+        var mediaType: String? = null
+        var thumbnailUrl: String? = null
+
+        var eventType = parser.next()
+        while (!(eventType == XmlPullParser.END_TAG && parser.name.equals("entry", ignoreCase = true))) {
+            if (eventType == XmlPullParser.START_TAG) {
+                val name = parser.name
+                when (name.lowercase(Locale.US)) {
+                    "title" -> title = readText(parser)
+                    "link" -> {
+                        val rel = parser.getAttributeValue(null, "rel")
+                        val href = parser.getAttributeValue(null, "href")
+                        val type = parser.getAttributeValue(null, "type")
+                        if (rel == "enclosure" && !href.isNullOrBlank()) {
+                            val derivedType = getMediaType(href, type)
+                            if (derivedType == "image") {
+                                if (thumbnailUrl == null) thumbnailUrl = href
+                                // NOSLOP_FEED_TYPES_V1 — in a photo stream the image is the item itself.
+                                if (photoStream && mediaUrl == null) {
+                                    mediaUrl = href
+                                    mediaType = "image"
+                                }
+                            } else {
+                                mediaUrl = href
+                                mediaType = derivedType
+                            }
+                        } else if (rel == null || rel == "alternate") {
+                            link = href ?: ""
+                        }
+                        skip(parser)
+                    }
+                    "summary", "content" -> summary = readText(parser)
+                    "updated", "published" -> updatedStr = readText(parser)
+                    "id" -> idStr = readText(parser)
+                    "author" -> authorStr = readAuthor(parser)
+                    "yt:videoid" -> {
+                        val videoId = readText(parser)
+                        mediaUrl = "https://www.youtube-nocookie.com/embed/$videoId"
+                        mediaType = "video"
+                        thumbnailUrl = "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+                    }
+                    "media:content" -> {
+                        val encUrl = parser.getAttributeValue(null, "url")
+                        val encType = parser.getAttributeValue(null, "type")
+                        if (!encUrl.isNullOrBlank()) {
+                            val derivedType = getMediaType(encUrl, encType)
+                            if (derivedType == "image") {
+                                if (thumbnailUrl == null) thumbnailUrl = encUrl
+                                // NOSLOP_FEED_TYPES_V1 — in a photo stream the image is the item itself.
+                                if (photoStream && mediaUrl == null) {
+                                    mediaUrl = encUrl
+                                    mediaType = "image"
+                                }
+                            } else {
+                                mediaUrl = encUrl
+                                mediaType = derivedType
+                            }
+                        }
+                        skip(parser)
+                    }
+                    "media:group" -> {
+                        val groupResult = parseMediaGroup(parser)
+                        if (groupResult.first != null) {
+                            if (mediaUrl == null) {
+                                mediaUrl = groupResult.first
+                                mediaType = groupResult.second
+                            }
+                            thumbnailUrl = groupResult.first
+                        }
+                    }
+                    "media:thumbnail" -> {
+                        val thumbUrl = parser.getAttributeValue(null, "url")
+                        if (!thumbUrl.isNullOrBlank()) {
+                            thumbnailUrl = thumbUrl
+                        }
+                        skip(parser)
+                    }
+                    else -> skip(parser)
+                }
+            }
+            eventType = parser.next()
+        }
+
+        var cleanedDesc = stripHtml(summary).take(600)
+        if (cleanedDesc.trim().equals("Comments", ignoreCase = true) || cleanedDesc.trim().equals("Comment", ignoreCase = true)) {
+            cleanedDesc = ""
+            summary = ""
+        }
+        val id = idStr.ifBlank { link.ifBlank { title + updatedStr } }
+
+        if (mediaUrl == null && thumbnailUrl == null) {
+            // Extract embedded images for thumbnail display only.
+            // Do NOT promote to mediaType="image" — RSS articles with images are still articles.
+            val embeddedImage = extractFirstImage(summary)
+            if (embeddedImage != null) {
+                thumbnailUrl = embeddedImage
+            }
+        }
+
+        return FeedItem(
+            id = "atom_${sourceId}_${id.hashCode()}",
+            sourceId = sourceId,
+            title = title,
+            url = link,
+            author = authorStr,
+            excerpt = cleanedDesc,
+            publishedAt = parseDate(updatedStr),
+            fullContent = summary,
+            mediaUrl = mediaUrl,
+            mediaType = mediaType,
+            thumbnailUrl = thumbnailUrl
+        )
+    }
+
+    private fun parseMediaGroup(parser: XmlPullParser): Pair<String?, String?> {
+        var url: String? = null
+        var type: String? = null
+        var eventType = parser.next()
+        while (!(eventType == XmlPullParser.END_TAG && parser.name.equals("media:group", ignoreCase = true))) {
+            if (eventType == XmlPullParser.START_TAG) {
+                when (parser.name.lowercase(Locale.US)) {
+                    "media:content" -> {
+                        url = parser.getAttributeValue(null, "url")
+                        type = getMediaType(url ?: "", parser.getAttributeValue(null, "type"))
+                        skip(parser)
+                    }
+                    "media:thumbnail" -> {
+                        if (url == null) {
+                            url = parser.getAttributeValue(null, "url")
+                            type = "image"
+                        }
+                        skip(parser)
+                    }
+                    else -> skip(parser)
+                }
+            }
+            eventType = parser.next()
+        }
+        return Pair(url, type)
+    }
+
+    private fun readAuthor(parser: XmlPullParser): String? {
+        var authorName: String? = null
+        var eventType = parser.next()
+        while (!(eventType == XmlPullParser.END_TAG && parser.name.equals("author", ignoreCase = true))) {
+            if (eventType == XmlPullParser.START_TAG && parser.name.equals("name", ignoreCase = true)) {
+                authorName = readText(parser)
+            } else if (eventType == XmlPullParser.START_TAG) {
+                skip(parser)
+            }
+            eventType = parser.next()
+        }
+        return authorName
+    }
+
+    private fun readText(parser: XmlPullParser): String {
+        var result = ""
+        if (parser.next() == XmlPullParser.TEXT) {
+            result = parser.text
+            parser.nextTag()
+        }
+        return result
+    }
+
+    private fun skip(parser: XmlPullParser) {
+        if (parser.eventType != XmlPullParser.START_TAG) {
+            throw IllegalStateException()
+        }
+        var depth = 1
+        while (depth != 0) {
+            when (parser.next()) {
+                XmlPullParser.END_TAG -> depth--
+                XmlPullParser.START_TAG -> depth++
+            }
+        }
+    }
+
+    fun stripHtml(html: String): String = com.noslop.app.feeds.api.stripHtml(html)
+
+    private fun extractFirstImage(html: String): String? {
+        if (html.isBlank()) return null
+        
+        val imgPattern = Regex("<img[^>]+(?:src|data-src|srcset)\\s*=\\s*['\"]?([^'\"\\s>]+)", RegexOption.IGNORE_CASE)
+        val imgMatches = imgPattern.findAll(html)
+        for (match in imgMatches) {
+            val url = match.groupValues[1].substringBefore(",").substringBefore(" ").trim()
+            if (url.isBlank()) continue
+            val lowerUrl = url.lowercase(Locale.US)
+            if (lowerUrl.contains("pixel") || lowerUrl.contains("tracker") || lowerUrl.contains("1x1") ||
+                lowerUrl.contains("gravatar") || lowerUrl.contains("feedsportal") || lowerUrl.contains("badge") ||
+                lowerUrl.contains("icon") || lowerUrl.contains("logo") || lowerUrl.contains("spinner") || lowerUrl.contains(".svg")) {
+                continue
+            }
+            if (url.startsWith("http") || url.startsWith("//")) {
+                return normalizeUrl(url)
+            }
+        }
+        
+        val metaPattern = Regex("<meta[^>]+(?:property|name)\\s*=\\s*['\"]?(?:og|twitter):image['\"]?[^>]+content\\s*=\\s*['\"]?([^'\"\\s>]+)", RegexOption.IGNORE_CASE)
+        val metaUrl = metaPattern.find(html)?.groupValues?.get(1)?.trim()
+        if (!metaUrl.isNullOrBlank() && (metaUrl.startsWith("http") || metaUrl.startsWith("//"))) {
+            return normalizeUrl(metaUrl)
+        }
+
+        return null
+    }
+
+    fun normalizeUrl(url: String): String {
+        var clean = url.trim()
+        clean = android.text.Html.fromHtml(clean, android.text.Html.FROM_HTML_MODE_COMPACT).toString().trim()
+        if (clean.startsWith("//")) return "https:$clean"
+        if (clean.startsWith("http://")) return "https://" + clean.substring(7)
+        if (clean.contains(" ")) return clean.replace(" ", "%20")
+        return clean
+    }
+
+
+}

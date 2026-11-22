@@ -1,0 +1,2150 @@
+// app/src/main/java/com/noslop/app/ui/tabs/SettingsTab.kt
+package com.noslop.app.ui.tabs
+
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.material3.TabRowDefaults
+import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.noslop.app.ui.NoSlopViewModel
+import com.noslop.app.ui.theme.*
+import androidx.compose.ui.graphics.Color
+import com.noslop.app.ui.*
+import com.noslop.app.ui.components.*
+import com.noslop.app.util.tr // Added translation extension
+import com.noslop.app.util.UpdateManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import kotlinx.coroutines.launch
+
+@Composable
+fun SettingsTab(viewModel: NoSlopViewModel, onNavigateToHubs: () -> Unit = {}) {
+    val torState by viewModel.torReadyState.collectAsState()
+    val isTorChecking by viewModel.isTorChecking.collectAsState()
+    val mediaSettings by viewModel.mediaSettings.collectAsState()
+    val isEncryptionActive by viewModel.isEncryptionActive.collectAsState()
+    val updateInfo by viewModel.updateInfo.collectAsState()
+    val savedUpdate by viewModel.savedUpdate.collectAsState()
+    val readyUpdate = savedUpdate?.takeIf { com.noslop.app.util.UpdatePolicy.isReadyToInstall(it.version, updateInfo?.latestVersion) }
+    val hubDeploymentStatus by viewModel.hubDeploymentStatus.collectAsState()
+    val context = LocalContext.current
+    val startUpdate = rememberUpdateStarter()
+
+    var selectedSettingsScreen by remember { mutableStateOf(0) }
+    val isCreatorEnabled by viewModel.isCreatorEnabled.collectAsState()
+    // D10e: tabs are chosen by name, not position, so Studio can sit before System and a tab that
+    // disappears (Studio when creator mode is turned off) falls back to General.
+    var selectedTab by remember { mutableStateOf("general") }
+    val tabKeys = if (isCreatorEnabled) {
+        listOf("general", "network", "content", "studio", "system")
+    } else {
+        listOf("general", "network", "content", "system")
+    }
+    val tabTitles = tabKeys.map { key ->
+        when (key) {
+            "general" -> "General".tr
+            "network" -> "Network".tr
+            "content" -> "Content".tr
+            "studio" -> "Studio".tr
+            else -> "System".tr
+        }
+    }
+    val currentTab = if (selectedTab in tabKeys) selectedTab else "general"
+    val selectedTabIndex = tabKeys.indexOf(currentTab)
+    var showDonationModal by remember { mutableStateOf(false) }
+    var showAboutModal by remember { mutableStateOf(false) }
+
+    if (selectedSettingsScreen == 1) {
+        LogsViewerScreen(viewModel, onBack = { selectedSettingsScreen = 0 })
+    } else if (selectedSettingsScreen == 3) {
+        ApiKeysScreen(viewModel = viewModel, onBack = { selectedSettingsScreen = 0 })
+    } else if (selectedSettingsScreen == 5) {
+        ContentPreferencesScreen(
+            viewModel = viewModel,
+            onBack = { selectedSettingsScreen = 0 },
+            onNavigateToMeshFilters = { selectedSettingsScreen = 7 }
+        )
+    } else if (selectedSettingsScreen == 6) {
+        ReportIssueScreen(onBack = { selectedSettingsScreen = 0 })
+    } else if (selectedSettingsScreen == 7) {
+        MeshFiltersScreen(viewModel = viewModel, onBack = { selectedSettingsScreen = 5 })
+    } else if (selectedSettingsScreen == 8) {
+        ProfileScreen(viewModel = viewModel, onBack = { selectedSettingsScreen = 0 })
+    } else if (selectedSettingsScreen == 9) {
+        CreatorStudioTab(viewModel = viewModel, onBack = { selectedSettingsScreen = 0 })
+    } else {
+        Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+            Text(
+                text = "System Settings".tr,
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.Bold,
+                color = TextLight,
+                modifier = Modifier.padding(bottom = 16.dp)
+            )
+
+            ScrollableTabRow(
+                selectedTabIndex = selectedTabIndex,
+                containerColor = SurfaceDark,
+                contentColor = AccentGreen,
+                edgePadding = 8.dp,
+                modifier = Modifier.padding(bottom = 16.dp),
+                divider = { HorizontalDivider(color = BorderSubtle) },
+                indicator = { tabPositions ->
+                    if (selectedTabIndex < tabPositions.size) {
+                        TabRowDefaults.SecondaryIndicator(
+                            Modifier.tabIndicatorOffset(tabPositions[selectedTabIndex]),
+                            color = AccentGreen
+                        )
+                    }
+                }
+            ) {
+                tabTitles.forEachIndexed { index, title ->
+                    Tab(
+                        selected = selectedTabIndex == index,
+                        onClick = { selectedTab = tabKeys[index] },
+                        text = { Text(title, fontWeight = FontWeight.Bold) },
+                        selectedContentColor = AccentGreen,
+                        unselectedContentColor = TextMuted
+                    )
+                }
+            }
+
+            LazyColumn(modifier = Modifier.weight(1f)) {
+                if (currentTab == "general") {
+                if (updateInfo != null) {
+                    item {
+                        Card(
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                            colors = CardDefaults.cardColors(containerColor = DestructiveRed.copy(alpha = 0.2f)),
+                            border = BorderStroke(1.dp, DestructiveRed)
+                        ) {
+                            Column(modifier = Modifier.padding(16.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.SystemUpdate, contentDescription = null, tint = DestructiveRed)
+                                    Spacer(modifier = Modifier.width(16.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            if (readyUpdate != null) "Update Ready to Install".tr else "Update Available".tr,
+                                            fontWeight = FontWeight.Bold,
+                                            color = TextLight
+                                        )
+                                        Text(
+                                            "Version {latest} is out (you have {current}).".tr
+                                                .replace("{latest}", updateInfo!!.latestVersion)
+                                                .replace("{current}", updateInfo!!.currentVersion),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = TextLight
+                                        )
+                                    }
+                                }
+                                Spacer(modifier = Modifier.height(12.dp))
+                                
+                                // NOSLOP_SAVE_TO_DOWNLOADS_V1: NoSlop downloads and verifies the update,
+                                // then saves it to Download; the user installs it from their Files app.
+                                readyUpdate?.let { ready ->
+                                    if (ready.checksumVerified) {
+                                        com.noslop.app.ui.components.UpdateChecksumBadge()
+                                        Spacer(modifier = Modifier.height(12.dp))
+                                    }
+                                    com.noslop.app.ui.components.UpdateReadyMessage(ready)
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                }
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                                    if (readyUpdate == null) {
+                                        Button(
+                                            onClick = { startUpdate(updateInfo!!) },
+                                            colors = ButtonDefaults.buttonColors(containerColor = DestructiveRed)
+                                        ) {
+                                            Text("Download Update".tr, color = TextLight)
+                                        }
+                                    } else {
+                                        TextButton(onClick = { startUpdate(updateInfo!!) }) {
+                                            Text("Download Again".tr, color = TextLight)
+                                        }
+                                        if (UpdateManager.canOpenDownloads) {
+                                            Button(
+                                                onClick = { UpdateManager.openDownloads(context) },
+                                                colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = PrimaryBlack)
+                                            ) {
+                                                Text("Open Downloads".tr, fontWeight = FontWeight.Bold)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                item {
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp).clickable { showDonationModal = true },
+                        colors = CardDefaults.cardColors(containerColor = AccentGreen.copy(alpha = 0.1f)),
+                        border = BorderStroke(1.dp, AccentGreen)
+                    ) {
+                        Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Favorite, contentDescription = null, tint = AccentGreen)
+                            Spacer(modifier = Modifier.width(16.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Help Development".tr, fontWeight = FontWeight.Bold, color = AccentGreen)
+                                Text("Support Gabby's work with a small donation".tr, style = MaterialTheme.typography.bodySmall, color = TextLight)
+                            }
+                        }
+                    }
+                }
+                if (!isEncryptionActive) {
+                    item {
+                        Card(
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                            colors = CardDefaults.cardColors(containerColor = DestructiveRed.copy(alpha = 0.2f)),
+                            border = BorderStroke(1.dp, DestructiveRed)
+                        ) {
+                            Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Security, contentDescription = null, tint = DestructiveRed)
+                                Spacer(modifier = Modifier.width(16.dp))
+                                Column {
+                                    Text("Security Warning".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                                    Text("Hardware-backed encryption is unavailable. Your keys are stored in plaintext.".tr, style = MaterialTheme.typography.bodySmall, color = TextLight)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                }
+                if (currentTab == "network") {
+                item {
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                        colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+                        border = BorderStroke(1.dp, BorderSubtle)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Text(
+                                text = "TOR ROUTING STATUS".tr,
+                                style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 2.sp),
+                                color = TextMuted,
+                                fontWeight = FontWeight.Bold
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(10.dp)
+                                                .clip(RoundedCornerShape(50))
+                                                .background(if (torState.first) AccentGreen else DestructiveRed)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = if (torState.first) "Active Tor Proxy".tr else "Tor Disconnected".tr,
+                                            fontWeight = FontWeight.Bold,
+                                            color = TextLight
+                                        )
+                                    }
+                                    Text(
+                                        text = torState.second,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = TextMuted,
+                                        modifier = Modifier.padding(top = 4.dp)
+                                    )
+                                }
+
+                                Column(horizontalAlignment = Alignment.End) {
+                                    Button(
+                                        onClick = { viewModel.refreshTorStatus() },
+                                        enabled = !isTorChecking,
+                                        colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = PrimaryBlack),
+                                        shape = RoundedCornerShape(4.dp)
+                                    ) {
+                                        Text("Test Tor".tr, fontWeight = FontWeight.Bold)
+                                    }
+                                    if (!torState.first) {
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        Button(
+                                            onClick = { viewModel.startTor(forceRestart = true) },
+                                            colors = ButtonDefaults.buttonColors(containerColor = DestructiveRed, contentColor = Color.White),
+                                            shape = RoundedCornerShape(4.dp)
+                                        ) {
+                                            Text("Reconnect Tor".tr, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                item {
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                        colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+                        border = BorderStroke(1.dp, BorderSubtle)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            val isForegroundServiceEnabled by viewModel.isForegroundServiceEnabled.collectAsState()
+                            var showForegroundWarning by remember { mutableStateOf(false) }
+                            var showForegroundDisableWarning by remember { mutableStateOf(false) }
+                            val hasHub = !hubDeploymentStatus.isNullOrBlank()
+                            
+                            val useTorForClearnet by viewModel.useTorForClearnet.collectAsState()
+                            val isAutoUpdateEnabled by viewModel.isAutoUpdateEnabled.collectAsState()
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+                                    Text("Route Clearnet via Tor".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                                    Text(
+                                        "Private by default. Turn off for faster media loading. Mesh traffic always uses Tor.".tr,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = TextMuted
+                                    )
+                                }
+                                Switch(
+                                    checked = useTorForClearnet,
+                                    onCheckedChange = { viewModel.setUseTorForClearnet(it) },
+                                    colors = SwitchDefaults.colors(
+                                        checkedThumbColor = PrimaryBlack,
+                                        checkedTrackColor = AccentGreen,
+                                        uncheckedThumbColor = TextMuted,
+                                        uncheckedTrackColor = SurfaceDark
+                                    )
+                                )
+                            }
+
+                            HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 8.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+                                    Text("Automatic Update Checks".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                                    Text(
+                                        "Check for new software releases over your selected network route.".tr,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = TextMuted
+                                    )
+                                }
+                                Switch(
+                                    checked = isAutoUpdateEnabled,
+                                    onCheckedChange = { viewModel.setAutoUpdateEnabled(it) },
+                                    colors = SwitchDefaults.colors(
+                                        checkedThumbColor = PrimaryBlack,
+                                        checkedTrackColor = AccentGreen,
+                                        uncheckedThumbColor = TextMuted,
+                                        uncheckedTrackColor = SurfaceDark
+                                    )
+                                )
+                            }
+                            
+                            HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 8.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+                                    Text("Foreground Service".tr, fontWeight = FontWeight.Bold, color = if (hasHub) TextMuted else TextLight)
+                                    Text(
+                                        "Keep NoSlop running in the background for uninterrupted mesh sync and media auto-downloads.".tr,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = TextMuted
+                                    )
+                                }
+                                Switch(
+                                    checked = isForegroundServiceEnabled && !hasHub,
+                                    enabled = !hasHub,
+                                    onCheckedChange = { 
+                                        if (it) {
+                                            showForegroundWarning = true
+                                        } else {
+                                            showForegroundDisableWarning = true
+                                        }
+                                    },
+                                    colors = SwitchDefaults.colors(
+                                        checkedThumbColor = PrimaryBlack,
+                                        checkedTrackColor = AccentGreen,
+                                        uncheckedThumbColor = TextMuted,
+                                        uncheckedTrackColor = SurfaceDark,
+                                        disabledCheckedThumbColor = PrimaryBlack,
+                                        disabledCheckedTrackColor = AccentGreen.copy(alpha = 0.5f),
+                                        disabledUncheckedThumbColor = TextMuted.copy(alpha = 0.5f),
+                                        disabledUncheckedTrackColor = SurfaceDark.copy(alpha = 0.5f)
+                                    )
+                                )
+                            }
+                            
+                            if (showForegroundWarning) {
+                                AlertDialog(
+                                    onDismissRequest = { showForegroundWarning = false },
+                                    containerColor = SurfaceDark,
+                                    title = { Text("Enable Background Mesh?".tr, color = TextLight, fontWeight = FontWeight.Bold) },
+                                    text = { 
+                                        // NOSLOP_HUB_BUILD_SWITCH_V1 — recommend a HUB only when this build has one.
+                                        Text(
+                                            if (com.noslop.app.HubFeature.enabled) "Running NoSlop permanently in the background will drain your battery and use extra data to keep the mesh network alive. We strongly recommend deploying a HAI-Net Home HUB instead, which handles this 24/7 without draining your phone.".tr
+                                            else "Running NoSlop permanently in the background will drain your battery and use extra data to keep the mesh network alive.".tr,
+                                            color = TextMuted
+                                        ) 
+                                    },
+                                    confirmButton = {
+                                        if (com.noslop.app.HubFeature.enabled) {
+                                            Button(
+                                                onClick = {
+                                                    showForegroundWarning = false
+                                                    onNavigateToHubs()
+                                                },
+                                                colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = PrimaryBlack)
+                                            ) {
+                                                Text("Deploy HUB".tr, fontWeight = FontWeight.Bold)
+                                            }
+                                        } else {
+                                            TextButton(onClick = {
+                                                showForegroundWarning = false
+                                                viewModel.setForegroundServiceEnabled(true)
+                                            }) {
+                                                Text("Enable Anyway".tr, color = DestructiveRed)
+                                            }
+                                        }
+                                    },
+                                    dismissButton = {
+                                        Row {
+                                            TextButton(onClick = { showForegroundWarning = false }) {
+                                                Text("Cancel".tr, color = TextMuted)
+                                            }
+                                            if (com.noslop.app.HubFeature.enabled) {
+                                                TextButton(onClick = {
+                                                    showForegroundWarning = false
+                                                    viewModel.setForegroundServiceEnabled(true)
+                                                }) {
+                                                    Text("Enable Anyway".tr, color = DestructiveRed)
+                                                }
+                                            }
+                                        }
+                                    }
+                                )
+                            }
+                            
+                            if (showForegroundDisableWarning) {
+                                AlertDialog(
+                                    onDismissRequest = { showForegroundDisableWarning = false },
+                                    containerColor = SurfaceDark,
+                                    title = { Text("Disable Background Mesh?".tr, color = TextLight, fontWeight = FontWeight.Bold) },
+                                    text = { 
+                                        Text(
+                                            "Whenever the Tor daemon restarts (like when you toggle the foreground service), it has to publish your .onion address to the global Tor network's Hidden Service Directories (HSDirs). For Tor v3 addresses, this publication process takes anywhere from 5 to 10 minutes to fully propagate. During this time, you may be temporarily unreachable by peers.".tr,
+                                            color = TextMuted
+                                        ) 
+                                    },
+                                    confirmButton = {
+                                        Button(
+                                            onClick = {
+                                                showForegroundDisableWarning = false
+                                                viewModel.setForegroundServiceEnabled(false)
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = DestructiveRed, contentColor = Color.White)
+                                        ) {
+                                            Text("Disable".tr, fontWeight = FontWeight.Bold)
+                                        }
+                                    },
+                                    dismissButton = {
+                                        TextButton(onClick = { showForegroundDisableWarning = false }) {
+                                            Text("Cancel".tr, color = AccentGreen)
+                                        }
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+
+                }
+                if (currentTab == "general") {
+                item {
+                    Text(
+                        text = "ACCOUNT & PREFERENCES".tr,
+                        style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 2.sp),
+                        color = TextMuted,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                        colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+                        border = BorderStroke(1.dp, BorderSubtle)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+
+                            // EDIT PROFILE
+                            Row(
+                                modifier = Modifier.fillMaxWidth().clickable { selectedSettingsScreen = 8 }.padding(vertical = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.Face, contentDescription = null, tint = AccentGreen)
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Text("Edit Profile".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                                }
+                                Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = TextMuted)
+                            }
+
+                            HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 8.dp))
+
+                            // APP LANGUAGE SELECTOR
+                            val appLanguage by viewModel.appLanguage.collectAsState()
+                            val availableLanguages = com.noslop.app.util.LanguageManager.supportedLanguages
+                            var expandedLang by remember { mutableStateOf(false) }
+                            
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+                                    Text("App Language".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                                    Text(
+                                        "Change the interface language.".tr,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = TextMuted
+                                    )
+                                }
+                                
+                                Box {
+                                    OutlinedButton(
+                                        onClick = { expandedLang = true },
+                                        colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentGreen),
+                                        border = BorderStroke(1.dp, BorderSubtle),
+                                        contentPadding = PaddingValues(horizontal = 12.dp)
+                                    ) {
+                                        Text(availableLanguages.find { it.first == appLanguage }?.second ?: appLanguage)
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Icon(Icons.Default.ArrowDropDown, contentDescription = null)
+                                    }
+                                    DropdownMenu(
+                                        expanded = expandedLang,
+                                        onDismissRequest = { expandedLang = false },
+                                        modifier = Modifier.background(SurfaceDark)
+                                    ) {
+                                        availableLanguages.forEach { (code, name) ->
+                                            DropdownMenuItem(
+                                                text = { Text(name, color = TextLight) },
+                                                onClick = {
+                                                    viewModel.updateAppLanguage(code)
+                                                    expandedLang = false
+                                                }
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 8.dp))
+
+                            // NOSLOP_SCREEN_SECURITY_V1
+                            com.noslop.app.ui.components.ScreenSecuritySetting()
+
+                            HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 8.dp))
+
+                            // NOSLOP_DB_ENCRYPTION_V1
+                            com.noslop.app.ui.components.DbEncryptionSetting()
+
+                            HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 8.dp))
+
+                            // NOSLOP_MEDIA_ENCRYPTION_V1
+                            com.noslop.app.ui.components.MediaEncryptionSetting()
+
+                            HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 8.dp))
+
+                            // SEND CHAT ON ENTER
+                            val isSendOnEnterEnabled by viewModel.isSendOnEnterEnabled.collectAsState()
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+                                    Text("Send Chat on Enter".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                                    Text(
+                                        "Pressing enter on the on-screen keyboard sends the message immediately.".tr,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = TextMuted
+                                    )
+                                }
+                                Switch(
+                                    checked = isSendOnEnterEnabled,
+                                    onCheckedChange = { viewModel.setSendOnEnterEnabled(it) },
+                                    colors = SwitchDefaults.colors(
+                                        checkedThumbColor = PrimaryBlack,
+                                        checkedTrackColor = AccentGreen,
+                                        uncheckedThumbColor = TextMuted,
+                                        uncheckedTrackColor = SurfaceDark
+                                    )
+                                )
+                            }
+
+                            HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 8.dp))
+
+                            // NOTIFICATIONS
+                            val notificationSettings by viewModel.notificationSettings.collectAsState()
+                            
+                            Text("Notifications".tr, color = AccentGreen, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 8.dp))
+
+                            // NOSLOP_PHONE_NOTIFICATIONS_V1 — the phone's notification shade, above the in-app choices.
+                            com.noslop.app.ui.components.PhoneNotificationsSetting(
+                                enabled = notificationSettings.phone,
+                                onEnabledChange = { viewModel.updateNotificationSettings(notificationSettings.copy(phone = it)) }
+                            )
+                            HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 4.dp))
+                            
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Direct Messages".tr, color = TextLight, fontSize = 14.sp)
+                                Switch(
+                                    checked = notificationSettings.dms,
+                                    onCheckedChange = { viewModel.updateNotificationSettings(notificationSettings.copy(dms = it)) },
+                                    colors = SwitchDefaults.colors(checkedThumbColor = AccentGreen)
+                                )
+                            }
+                            
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Comments & Replies".tr, color = TextLight, fontSize = 14.sp)
+                                Switch(
+                                    checked = notificationSettings.comments,
+                                    onCheckedChange = { viewModel.updateNotificationSettings(notificationSettings.copy(comments = it)) },
+                                    colors = SwitchDefaults.colors(checkedThumbColor = AccentGreen)
+                                )
+                            }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Mentions".tr, color = TextLight, fontSize = 14.sp)
+                                Switch(
+                                    checked = notificationSettings.mentions,
+                                    onCheckedChange = { viewModel.updateNotificationSettings(notificationSettings.copy(mentions = it)) },
+                                    colors = SwitchDefaults.colors(checkedThumbColor = AccentGreen)
+                                )
+                            }
+                            
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Reactions".tr, color = TextLight, fontSize = 14.sp)
+                                Switch(
+                                    checked = notificationSettings.reactions,
+                                    onCheckedChange = { viewModel.updateNotificationSettings(notificationSettings.copy(reactions = it)) },
+                                    colors = SwitchDefaults.colors(checkedThumbColor = AccentGreen)
+                                )
+                            }
+                            
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Connection Requests".tr, color = TextLight, fontSize = 14.sp)
+                                Switch(
+                                    checked = notificationSettings.connectionRequests,
+                                    onCheckedChange = { viewModel.updateNotificationSettings(notificationSettings.copy(connectionRequests = it)) },
+                                    colors = SwitchDefaults.colors(checkedThumbColor = AccentGreen)
+                                )
+                            }
+                            
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("System Alerts".tr, color = TextLight, fontSize = 14.sp)
+                                Switch(
+                                    checked = notificationSettings.system,
+                                    onCheckedChange = { viewModel.updateNotificationSettings(notificationSettings.copy(system = it)) },
+                                    colors = SwitchDefaults.colors(checkedThumbColor = AccentGreen)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                }
+                if (currentTab == "content") {
+                item {
+                    Text(
+                        text = "MEDIA & PRIVACY".tr,
+                        style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 2.sp),
+                        color = TextMuted,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                        colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+                        border = BorderStroke(1.dp, BorderSubtle)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            @Composable
+                            fun QualitySelector(label: String, currentValue: String, onSelected: (String) -> Unit) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(label.tr, color = TextLight, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                                    var expanded by remember { mutableStateOf(false) }
+                                    Box {
+                                        OutlinedButton(
+                                            onClick = { expanded = true },
+                                            colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentGreen),
+                                            border = BorderStroke(1.dp, BorderSubtle),
+                                            contentPadding = PaddingValues(horizontal = 12.dp),
+                                            modifier = Modifier.height(36.dp)
+                                        ) {
+                                            Text(currentValue.uppercase().tr, fontSize = 12.sp)
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Icon(Icons.Default.ArrowDropDown, contentDescription = null, modifier = Modifier.size(16.dp))
+                                        }
+                                        DropdownMenu(
+                                            expanded = expanded,
+                                            onDismissRequest = { expanded = false },
+                                            modifier = Modifier.background(SurfaceDark)
+                                        ) {
+                                            listOf("high", "medium", "low").forEach { q ->
+                                                DropdownMenuItem(
+                                                    text = { Text(q.uppercase().tr, color = TextLight) },
+                                                    onClick = {
+                                                        onSelected(q)
+                                                        expanded = false
+                                                    }
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            Text("Media Quality".tr, color = TextLight, fontWeight = FontWeight.Bold)
+                            Text("Affects clearnet streams and mesh upload compression.".tr, color = TextMuted, fontSize = 12.sp, modifier = Modifier.padding(bottom = 12.dp))
+                            QualitySelector("Video Quality", mediaSettings.videoQuality) { viewModel.updateMediaSettings(mediaSettings.copy(videoQuality = it)) }
+                            QualitySelector("Audio Quality", mediaSettings.audioQuality) { viewModel.updateMediaSettings(mediaSettings.copy(audioQuality = it)) }
+                            QualitySelector("Image Quality", mediaSettings.imageQuality) { viewModel.updateMediaSettings(mediaSettings.copy(imageQuality = it)) }
+
+                            HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(bottom = 16.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Automatic Media Download".tr, color = TextLight, fontWeight = FontWeight.Bold)
+                                Switch(
+                                    checked = mediaSettings.enabled,
+                                    onCheckedChange = { viewModel.updateMediaSettings(mediaSettings.copy(enabled = it)) },
+                                    colors = SwitchDefaults.colors(checkedThumbColor = AccentGreen)
+                                )
+                            }
+                            
+                            if (mediaSettings.enabled) {
+                                HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 12.dp))
+                                
+                                Text(
+                                    text = "Max File Size: {size} MB".tr.replace("{size}", mediaSettings.maxFileSizeMB.toString()),
+                                    color = TextLight,
+                                    fontSize = 14.sp
+                                )
+                                Slider(
+                                    value = mediaSettings.maxFileSizeMB.toFloat(),
+                                    onValueChange = { viewModel.updateMediaSettings(mediaSettings.copy(maxFileSizeMB = it.toInt())) },
+                                    valueRange = 1f..1000f,
+                                    colors = SliderDefaults.colors(thumbColor = AccentGreen, activeTrackColor = AccentGreen)
+                                )
+                                
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+                                        Text("Friends".tr, color = TextLight, fontSize = 14.sp)
+                                        Text("only auto-download media from contacts".tr, color = TextMuted, fontSize = 12.sp)
+                                    }
+                                    Switch(
+                                        checked = mediaSettings.autoDownloadFriends,
+                                        onCheckedChange = { viewModel.updateMediaSettings(mediaSettings.copy(autoDownloadFriends = it)) },
+                                        colors = SwitchDefaults.colors(checkedThumbColor = AccentGreen)
+                                    )
+                                }
+                                
+                                var showPublicMediaWarning by remember { mutableStateOf(false) }
+                                
+                                if (showPublicMediaWarning) {
+                                    AlertDialog(
+                                        onDismissRequest = { showPublicMediaWarning = false },
+                                        containerColor = SurfaceDark,
+                                        title = { Text("Enable Public Media?".tr, color = TextLight, fontWeight = FontWeight.Bold) },
+                                        text = { Text("You'll download 3rd party media!".tr, color = TextMuted) },
+                                        confirmButton = {
+                                            Button(
+                                                onClick = {
+                                                    showPublicMediaWarning = false
+                                                    viewModel.updateMediaSettings(mediaSettings.copy(autoDownloadPublic = true))
+                                                },
+                                                colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlack)
+                                            ) {
+                                                Text("Accept".tr, color = AccentGreen)
+                                            }
+                                        },
+                                        dismissButton = {
+                                            Button(
+                                                onClick = { showPublicMediaWarning = false },
+                                                colors = ButtonDefaults.buttonColors(containerColor = SurfaceDark)
+                                            ) {
+                                                Text("Cancel".tr, color = TextMuted)
+                                            }
+                                        }
+                                    )
+                                }
+                                
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+                                        Text("Public".tr, color = TextLight, fontSize = 14.sp)
+                                        Text("Also auto-download media from public broadcasts".tr, color = TextMuted, fontSize = 12.sp)
+                                    }
+                                    Switch(
+                                        checked = mediaSettings.autoDownloadPublic,
+                                        onCheckedChange = { 
+                                            if (it) {
+                                                showPublicMediaWarning = true
+                                            } else {
+                                                viewModel.updateMediaSettings(mediaSettings.copy(autoDownloadPublic = false))
+                                            }
+                                        },
+                                        colors = SwitchDefaults.colors(checkedThumbColor = AccentGreen)
+                                    )
+                                }
+                            }
+                            
+                            HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 12.dp))
+                            
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+                                    Text("Fallback Web Embeds".tr, color = TextLight, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                    Text("Use hidden web browser to play videos when native extraction fails (can be slow).".tr, color = TextMuted, fontSize = 12.sp)
+                                }
+                                Switch(
+                                    checked = mediaSettings.enableWebViewEmbeds,
+                                    onCheckedChange = { viewModel.updateMediaSettings(mediaSettings.copy(enableWebViewEmbeds = it)) },
+                                    colors = SwitchDefaults.colors(checkedThumbColor = AccentGreen)
+                                )
+                            }
+                        }
+                    }
+
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                        colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+                        border = BorderStroke(1.dp, BorderSubtle)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+                                    Text("Background Playback".tr, color = TextLight, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                    Text("Keep audio/video playing while browsing other tabs.".tr, color = TextMuted, fontSize = 12.sp)
+                                }
+                                Switch(
+                                    checked = mediaSettings.backgroundPlayEnabled,
+                                    onCheckedChange = { viewModel.updateMediaSettings(mediaSettings.copy(backgroundPlayEnabled = it)) },
+                                    colors = SwitchDefaults.colors(checkedThumbColor = AccentGreen)
+                                )
+                            }
+                            
+                            if (mediaSettings.backgroundPlayEnabled) {
+                                Spacer(modifier = Modifier.height(12.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                    Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+                                        Text("Play Outside App".tr, color = TextLight, fontSize = 14.sp)
+                                        Text("Continue playing when NoSlop is minimized.".tr, color = TextMuted, fontSize = 12.sp)
+                                    }
+                                    Switch(
+                                        checked = mediaSettings.backgroundPlayOutsideApp,
+                                        onCheckedChange = { viewModel.updateMediaSettings(mediaSettings.copy(backgroundPlayOutsideApp = it)) },
+                                        colors = SwitchDefaults.colors(checkedThumbColor = AccentGreen)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                        colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+                        border = BorderStroke(1.dp, BorderSubtle)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            // Content Transparency Toggle
+                            val isContentTransparencyEnabled by viewModel.isContentTransparencyEnabled.collectAsState()
+                            Column {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+                                        Text("Opt-in Transparency".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                                        Text(
+                                            "When enabled, community-flagged content shows a warning badge instead of a blocking overlay, letting you decide what to view.".tr,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = TextMuted
+                                        )
+                                    }
+                                    Switch(
+                                        checked = isContentTransparencyEnabled,
+                                        onCheckedChange = { viewModel.toggleContentTransparency() },
+                                        colors = SwitchDefaults.colors(
+                                            checkedThumbColor = PrimaryBlack,
+                                            checkedTrackColor = Color.Yellow,
+                                            uncheckedThumbColor = TextMuted,
+                                            uncheckedTrackColor = SurfaceDark
+                                        )
+
+                                    )
+                                }
+                            }
+                            }
+                        }
+                    }
+
+                }
+                if (currentTab == "network") {
+                item {
+                    Text(
+                        text = "MESH DISCOVERABILITY".tr,
+                        style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 2.sp),
+                        color = TextMuted,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                        colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+                        border = BorderStroke(1.dp, BorderSubtle)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            val isDiscoverableEnabled by viewModel.isDiscoverableEnabled.collectAsState()
+                            
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+                                    Text("Discoverable Mode".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                                    Text(
+                                        "Broadcast your ephemeral identity to the mesh so others can find you without a direct connection code.".tr,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = TextMuted
+                                    )
+                                }
+                                Switch(
+                                    checked = isDiscoverableEnabled,
+                                    onCheckedChange = { viewModel.setDiscoverableEnabled(it) },
+                                    colors = SwitchDefaults.colors(
+                                        checkedThumbColor = PrimaryBlack,
+                                        checkedTrackColor = AccentGreen,
+                                        uncheckedThumbColor = TextMuted,
+                                        uncheckedTrackColor = SurfaceDark
+                                    )
+                                )
+                            }
+
+                            HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 8.dp))
+
+                            val isCreatorEnabled by viewModel.isCreatorEnabled.collectAsState()
+                            var showCreatorDisableWarning by remember { mutableStateOf(false) }
+
+                            if (showCreatorDisableWarning) {
+                                AlertDialog(
+                                    onDismissRequest = { showCreatorDisableWarning = false },
+                                    containerColor = SurfaceDark,
+                                    title = {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Icon(Icons.Default.Warning, contentDescription = null, tint = DestructiveRed, modifier = Modifier.size(24.dp))
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text("Disable Creator Mode?".tr, color = TextLight, fontWeight = FontWeight.Bold)
+                                        }
+                                    },
+                                    text = {
+                                        Column {
+                                            Text(
+                                                "Disabling Creator Mode will disconnect your severable Creator ID. Any peers or followers who connected to your node using your Creator ID will permanently lose connection with you. Are you sure you want to proceed?".tr,
+                                                color = TextMuted
+                                            )
+                                            // D10d: point to the backup before the identity is gone for good.
+                                            Spacer(modifier = Modifier.height(10.dp))
+                                            Text(
+                                                "Back up your creator identity first (Studio, Back Up Creator Identity) if you may want it back. Without a backup it cannot be restored.".tr,
+                                                color = DestructiveRed,
+                                                fontSize = 13.sp
+                                            )
+                                        }
+                                    },
+                                    confirmButton = {
+                                        Button(
+                                            onClick = {
+                                                showCreatorDisableWarning = false
+                                                viewModel.setCreatorEnabled(false)
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = DestructiveRed, contentColor = Color.White)
+                                        ) {
+                                            Text("Disable Creator Mode".tr, fontWeight = FontWeight.Bold)
+                                        }
+                                    },
+                                    dismissButton = {
+                                        TextButton(onClick = { showCreatorDisableWarning = false }) {
+                                            Text("Keep Active".tr, color = AccentGreen)
+                                        }
+                                    }
+                                )
+                            }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+                                    Text("Creator Node".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                                    Text(
+                                        "Automatically accept connections and lock your media from being purged by auto-cleanup.".tr,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = TextMuted
+                                    )
+                                }
+                                Switch(
+                                    checked = isCreatorEnabled,
+                                    onCheckedChange = {
+                                        if (!it) {
+                                            showCreatorDisableWarning = true
+                                        } else {
+                                            viewModel.setCreatorEnabled(true)
+                                        }
+                                    },
+                                    colors = SwitchDefaults.colors(
+                                        checkedThumbColor = PrimaryBlack,
+                                        checkedTrackColor = AccentGreen,
+                                        uncheckedThumbColor = TextMuted,
+                                        uncheckedTrackColor = SurfaceDark
+                                    )
+                                )
+                            }
+
+                            // D10d: restore a creator identity file (a backup, or one moved from another device).
+                            var pendingRestoreUri by remember { mutableStateOf<android.net.Uri?>(null) }
+                            var restorePassphrase by remember { mutableStateOf<String?>(null) }
+                            var showRestorePassphrase by remember { mutableStateOf(false) }
+                            var showReplaceConfirm by remember { mutableStateOf(false) }
+                            var isRestoringCreator by remember { mutableStateOf(false) }
+                            var restoredCreator by remember { mutableStateOf<com.noslop.app.data.CreatorRestoreResult.Restored?>(null) }
+                            val restoreCreatorLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                                if (uri != null) {
+                                    pendingRestoreUri = uri
+                                    showRestorePassphrase = true
+                                }
+                            }
+                            fun runCreatorRestore(replaceExisting: Boolean) {
+                                val uri = pendingRestoreUri ?: return
+                                val passphrase = restorePassphrase ?: return
+                                isRestoringCreator = true
+                                viewModel.restoreCreatorIdentityFromUri(context, passphrase, uri, replaceExisting) { result ->
+                                    isRestoringCreator = false
+                                    when (result) {
+                                        is com.noslop.app.data.CreatorRestoreResult.Restored -> {
+                                            restoredCreator = result
+                                            pendingRestoreUri = null
+                                            restorePassphrase = null
+                                        }
+                                        com.noslop.app.data.CreatorRestoreResult.ConfirmReplace -> showReplaceConfirm = true
+                                        is com.noslop.app.data.CreatorRestoreResult.Failed -> {
+                                            pendingRestoreUri = null
+                                            restorePassphrase = null
+                                            android.widget.Toast.makeText(
+                                                context,
+                                                com.noslop.app.util.LanguageManager.translate("Creator identity not restored: {reason}").replace("{reason}", result.reason),
+                                                android.widget.Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+                                    }
+                                }
+                            }
+                            if (showRestorePassphrase) {
+                                CreatorPassphraseDialog(
+                                    title = "Restore Creator Identity".tr,
+                                    message = "Enter the passphrase the file was saved with. This device becomes the creator: it gets the creator keys, Studio profile, followers, posts and media.".tr,
+                                    confirmTwice = false,
+                                    confirmLabel = "Restore".tr,
+                                    onConfirm = { passphrase ->
+                                        showRestorePassphrase = false
+                                        restorePassphrase = passphrase
+                                        runCreatorRestore(replaceExisting = false)
+                                    },
+                                    onDismiss = {
+                                        showRestorePassphrase = false
+                                        pendingRestoreUri = null
+                                    }
+                                )
+                            }
+                            if (showReplaceConfirm) {
+                                CreatorReplaceConfirmDialog(
+                                    onReplace = {
+                                        showReplaceConfirm = false
+                                        runCreatorRestore(replaceExisting = true)
+                                    },
+                                    onDismiss = {
+                                        showReplaceConfirm = false
+                                        pendingRestoreUri = null
+                                        restorePassphrase = null
+                                    }
+                                )
+                            }
+                            restoredCreator?.let { restored ->
+                                CreatorRestoreResultDialog(result = restored, onDismiss = { restoredCreator = null })
+                            }
+                            OutlinedButton(
+                                onClick = { restoreCreatorLauncher.launch(arrayOf("*/*")) },
+                                enabled = !isRestoringCreator,
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentGreen),
+                                border = BorderStroke(1.dp, AccentGreen.copy(alpha = 0.6f)),
+                                modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                            ) {
+                                Text(if (isRestoringCreator) "Restoring creator identity...".tr else "Restore Creator Identity".tr)
+                            }
+                            Text(
+                                "Bring a creator identity to this device from a backup file or from another device.".tr,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = TextMuted,
+                                modifier = Modifier.padding(top = 4.dp, bottom = 4.dp)
+                            )
+
+                            if (isCreatorEnabled) {
+                                val creatorFundMeLink by viewModel.creatorFundMeLink.collectAsState()
+                                OutlinedTextField(
+                                    value = creatorFundMeLink,
+                                    onValueChange = { viewModel.setCreatorFundMeLink(it) },
+                                    label = { Text("Donation Link (Optional)".tr) },
+                                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedBorderColor = AccentGreen,
+                                        unfocusedBorderColor = BorderSubtle,
+                                        focusedTextColor = TextLight,
+                                        unfocusedTextColor = TextLight
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+                }
+
+                if (currentTab == "content") {
+                item {
+                    Text(
+                        text = "CONTENT AGGREGATOR".tr,
+                        style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 2.sp),
+                        color = TextMuted,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                        colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+                        border = BorderStroke(1.dp, BorderSubtle)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            val isAggregatorEnabled by viewModel.isAggregatorEnabled.collectAsState()
+                            
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+                                    Text("Clearnet Aggregator".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                                    Text(
+                                        "Automatically fetch content from RSS feeds and public APIs to mix with your mesh timeline.".tr,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = TextMuted
+                                    )
+                                }
+                                Switch(
+                                    checked = isAggregatorEnabled,
+                                    onCheckedChange = { viewModel.toggleAggregator() },
+                                    colors = SwitchDefaults.colors(
+                                        checkedThumbColor = PrimaryBlack,
+                                        checkedTrackColor = AccentGreen,
+                                        uncheckedThumbColor = TextMuted,
+                                        uncheckedTrackColor = SurfaceDark
+                                    )
+                                )
+                            }
+                            
+                            HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 8.dp))
+                            
+                            Row(
+                                modifier = Modifier.fillMaxWidth().clickable { selectedSettingsScreen = 5 }.padding(vertical = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.FilterList, contentDescription = null, tint = AccentGreen)
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Text("Filtering & Content Mix".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                                }
+                                Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = TextMuted)
+                            }
+                            
+                            HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 8.dp))
+                            
+                            Row(
+                                modifier = Modifier.fillMaxWidth().clickable { selectedSettingsScreen = 3 }.padding(vertical = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.VpnKey, contentDescription = null, tint = AccentGreen)
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Text("API Keys".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                                }
+                                Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = TextMuted)
+                            }
+                        }
+                    }
+
+                    // --- Break / Exit Reminders Section ---
+                    Text(
+                        text = "WELLBEING & LIMITS".tr,
+                        style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 2.sp),
+                        color = TextMuted,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                        colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+                        border = BorderStroke(1.dp, BorderSubtle)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            val breakEnabled by viewModel.breakReminderEnabled.collectAsState()
+                            val breakMode by viewModel.breakReminderMode.collectAsState()
+                            val breakSlides by viewModel.breakReminderIntervalSlides.collectAsState()
+                            val breakMinutes by viewModel.breakReminderIntervalMinutes.collectAsState()
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f).padding(end = 16.dp)) {
+                                    Text("Break & Exit Reminders".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                                    Text(
+                                        "Gentle prompts to step away and exit under your complete control.".tr,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = TextMuted
+                                    )
+                                }
+                                Switch(
+                                    checked = breakEnabled,
+                                    onCheckedChange = { viewModel.setBreakReminderEnabled(it) },
+                                    colors = SwitchDefaults.colors(
+                                        checkedThumbColor = PrimaryBlack,
+                                        checkedTrackColor = AccentGreen,
+                                        uncheckedThumbColor = TextMuted,
+                                        uncheckedTrackColor = SurfaceDark
+                                    )
+                                )
+                            }
+
+                            if (breakEnabled) {
+                                HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(vertical = 8.dp))
+                                Text("Trigger Type".tr, color = TextLight, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 12.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    FilterChip(
+                                        selected = breakMode == "slides",
+                                        onClick = { viewModel.setBreakReminderMode("slides") },
+                                        label = { Text("By Slides Viewed".tr) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                            selectedContainerColor = AccentGreen,
+                                            selectedLabelColor = PrimaryBlack,
+                                            labelColor = TextMuted
+                                        )
+                                    )
+                                    FilterChip(
+                                        selected = breakMode == "time",
+                                        onClick = { viewModel.setBreakReminderMode("time") },
+                                        label = { Text("By Time Spent".tr) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                            selectedContainerColor = AccentGreen,
+                                            selectedLabelColor = PrimaryBlack,
+                                            labelColor = TextMuted
+                                        )
+                                    )
+                                }
+
+                                if (breakMode == "slides") {
+                                    Text(
+                                        text = "Remind every: {count} slides".tr.replace("{count}", breakSlides.toString()),
+                                        color = TextLight,
+                                        fontSize = 13.sp
+                                    )
+                                    Slider(
+                                        value = breakSlides.toFloat(),
+                                        onValueChange = { viewModel.setBreakReminderIntervalSlides(it.toInt()) },
+                                        valueRange = 10f..100f,
+                                        steps = 8,
+                                        colors = SliderDefaults.colors(thumbColor = AccentGreen, activeTrackColor = AccentGreen)
+                                    )
+                                } else {
+                                    Text(
+                                        text = "Remind every: {minutes} minutes".tr.replace("{minutes}", breakMinutes.toString()),
+                                        color = TextLight,
+                                        fontSize = 13.sp
+                                    )
+                                    Slider(
+                                        value = breakMinutes.toFloat(),
+                                        onValueChange = { viewModel.setBreakReminderIntervalMinutes(it.toInt()) },
+                                        valueRange = 5f..60f,
+                                        steps = 10,
+                                        colors = SliderDefaults.colors(thumbColor = AccentGreen, activeTrackColor = AccentGreen)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+
+                }
+                if (currentTab == "network") {
+                if (!hubDeploymentStatus.isNullOrBlank()) {
+                    item {
+                        Text(
+                            text = "HAI-NET HUB".tr,
+                            style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 2.sp),
+                            color = TextMuted,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+                        Card(
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                            colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+                            border = BorderStroke(1.dp, BorderSubtle)
+                        ) {
+                            var showUnlinkConfirm by remember { mutableStateOf(false) }
+
+                            if (showUnlinkConfirm) {
+                                AlertDialog(
+                                    onDismissRequest = { showUnlinkConfirm = false },
+                                    containerColor = SurfaceDark,
+                                    title = { Text("Disconnect Hub?".tr, color = TextLight) },
+                                    text = { Text("This will unlink your HAI-Net Hub from this app. You will need to re-deploy or configure it manually to reconnect.".tr, color = TextMuted) },
+                                    confirmButton = {
+                                        Button(
+                                            onClick = {
+                                                showUnlinkConfirm = false
+                                                viewModel.setHubDeploymentStatus("")
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = DestructiveRed, contentColor = Color.White)
+                                        ) {
+                                            Text("Disconnect".tr, fontWeight = FontWeight.Bold)
+                                        }
+                                    },
+                                    dismissButton = {
+                                        TextButton(onClick = { showUnlinkConfirm = false }) {
+                                            Text("Cancel".tr, color = AccentGreen)
+                                        }
+                                    }
+                                )
+                            }
+
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { showUnlinkConfirm = true }
+                                    .padding(16.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.LinkOff, contentDescription = null, tint = DestructiveRed)
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Column {
+                                        Text("Disconnect HAI-Net Hub".tr, fontWeight = FontWeight.Bold, color = DestructiveRed)
+                                        Text("Unlink this device from your active Hub".tr, style = MaterialTheme.typography.bodySmall, color = TextMuted)
+                                    }
+                                }
+                                Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = TextMuted)
+                            }
+
+                            HorizontalDivider(color = BorderSubtle, modifier = Modifier.padding(horizontal = 16.dp))
+
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        com.noslop.app.net.SshDeployer.clearPinnedHostKey(null)
+                                        android.widget.Toast.makeText(context, com.noslop.app.util.LanguageManager.translate("Pinned SSH host keys cleared"), android.widget.Toast.LENGTH_SHORT).show()
+                                    }
+                                    .padding(16.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(Icons.Default.KeyOff, contentDescription = null, tint = TextMuted)
+                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Column {
+                                        Text("Clear Pinned SSH Host Key".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                                        Text("Reset pinned fingerprint to allow connecting to a reinstalled Hub".tr, style = MaterialTheme.typography.bodySmall, color = TextMuted)
+                                    }
+                                }
+                                Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null, tint = TextMuted)
+                            }
+                        }
+                    }
+                }
+                }
+                if (currentTab == "system") {
+                item {
+                    Text(
+                        text = "DEVELOPER".tr,
+                        style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 2.sp),
+                        color = TextMuted,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { selectedSettingsScreen = 1 },
+                        colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+                        border = BorderStroke(1.dp, BorderSubtle)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(16.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Build, contentDescription = null, tint = AccentGreen)
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Column {
+                                    Text("Structured Debug Logs".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                                    Text("Examine packet drops, network, parser info.".tr, style = MaterialTheme.typography.bodySmall, color = TextMuted)
+                                }
+                            }
+                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = TextMuted)
+                        }
+                    }
+
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 16.dp)
+                            .clickable { selectedSettingsScreen = 6 },
+                        colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+                        border = BorderStroke(1.dp, BorderSubtle)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(16.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.BugReport, contentDescription = null, tint = AccentGreen)
+                                Spacer(modifier = Modifier.width(12.dp))
+                                Column {
+                                    Text("File a Bug Report".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                                    Text("Report issues or request features via GitHub.".tr, style = MaterialTheme.typography.bodySmall, color = TextMuted)
+                                }
+                            }
+                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = TextMuted)
+                        }
+                    }
+                }
+
+                item {
+                    Text(
+                        text = "DATA & BACKUP".tr,
+                        style = MaterialTheme.typography.labelSmall.copy(letterSpacing = 2.sp),
+                        color = TextMuted,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(top = 16.dp, bottom = 8.dp)
+                    )
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                        colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+                        border = BorderStroke(1.dp, BorderSubtle)
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            var showFactoryResetConfirm by remember { mutableStateOf(false) }
+                            var showMnemonicDialog by remember { mutableStateOf(false) }
+                            var isExporting by remember { mutableStateOf(false) }
+                            var mnemonicInput by remember { mutableStateOf("") }
+                            var showImportWarning by remember { mutableStateOf(false) }
+                            var pendingImportUri by remember { mutableStateOf<android.net.Uri?>(null) }
+                            var importStatus by remember { mutableStateOf<String?>(null) }
+                            var showLegacyConfirmDialog by remember { mutableStateOf(false) }
+                            var showExportSuccessDialog by remember { mutableStateOf(false) }
+                            var pendingLegacyImportUri by remember { mutableStateOf<android.net.Uri?>(null) }
+                            var pendingLegacyMnemonic by remember { mutableStateOf("") }
+                            // R5b: the typed Word Cloud differs from the stored one; the user decides.
+                            var wordCloudMismatch by remember { mutableStateOf<com.noslop.app.data.WordCloudCheck.Differs?>(null) }
+                            var mismatchMediaOption by remember { mutableStateOf(com.noslop.app.data.BackupMediaOption.OWNED_ONLY) }
+
+                            val isBackupExporting by viewModel.isBackupExporting.collectAsState()
+
+                            var selectedMediaOption by remember { mutableStateOf(com.noslop.app.data.BackupMediaOption.OWNED_ONLY) }
+
+                            val exportLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+                                if (uri != null && mnemonicInput.isNotBlank()) {
+                                    val mnemonicToUse = mnemonicInput
+                                    val mediaOpt = selectedMediaOption
+                                    importStatus = com.noslop.app.util.LanguageManager.translate("Exporting backup...")
+                                    viewModel.exportBackupToUri(context, mnemonicToUse, uri, mediaOpt) { success, errMsg ->
+                                        if (success) {
+                                            showExportSuccessDialog = true
+                                            importStatus = null
+                                        } else {
+                                            importStatus = errMsg ?: com.noslop.app.util.LanguageManager.translate("Export failed.")
+                                        }
+                                    }
+                                    mnemonicInput = ""
+                                }
+                            }
+
+                            val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                                if (uri != null && mnemonicInput.isNotBlank()) {
+                                    pendingImportUri = uri
+                                    showImportWarning = true
+                                }
+                            }
+
+                            Button(
+                                onClick = { 
+                                    isExporting = true
+                                    showMnemonicDialog = true
+                                },
+                                enabled = !isBackupExporting,
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlack, contentColor = AccentGreen),
+                                border = BorderStroke(1.dp, AccentGreen)
+                            ) {
+                                if (isBackupExporting) {
+                                    CircularProgressIndicator(modifier = Modifier.size(18.dp), color = AccentGreen, strokeWidth = 2.dp)
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text("Exporting Backup...".tr, fontWeight = FontWeight.Bold)
+                                } else {
+                                    Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text("Export Profile (Zip)".tr, fontWeight = FontWeight.Bold)
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            Button(
+                                onClick = { 
+                                    isExporting = false
+                                    showMnemonicDialog = true
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlack, contentColor = AccentGreen),
+                                border = BorderStroke(1.dp, AccentGreen)
+                            ) {
+                                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Import Profile (Zip)".tr, fontWeight = FontWeight.Bold)
+                            }
+
+                            Spacer(modifier = Modifier.height(24.dp))
+                            HorizontalDivider(color = BorderSubtle)
+                            Spacer(modifier = Modifier.height(24.dp))
+
+                            val scope = rememberCoroutineScope()
+
+                            LaunchedEffect(showMnemonicDialog, isExporting) {
+                                if (com.noslop.app.BuildConfig.AUTOFILL_BACKUP_MNEMONIC && showMnemonicDialog && isExporting && mnemonicInput.isBlank()) {
+                                    val stored = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                        com.noslop.app.NoSlopApp.repository.getWordCloudMnemonic()
+                                    }
+                                    if (stored.isNotBlank()) mnemonicInput = stored
+                                }
+                            }
+
+                            if (showMnemonicDialog) {
+
+                                AlertDialog(
+                                    onDismissRequest = { showMnemonicDialog = false },
+                                    title = { Text(if (isExporting) "Export Identity Backup".tr else "Import Backup".tr, color = TextLight, fontWeight = FontWeight.Bold) },
+                                    text = {
+                                        Column {
+                                            if (isExporting) {
+                                                Text(
+                                                    "Your sovereign identity and database will be encrypted with your 12-word Word Cloud. Choose a backup format:".tr,
+                                                    color = TextMuted,
+                                                    fontSize = 13.sp
+                                                )
+                                                Spacer(modifier = Modifier.height(12.dp))
+
+                                                // Option 1: IDs & Keys Only (Lightweight)
+                                                Card(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .clickable { selectedMediaOption = com.noslop.app.data.BackupMediaOption.NONE },
+                                                    colors = CardDefaults.cardColors(
+                                                        containerColor = if (selectedMediaOption == com.noslop.app.data.BackupMediaOption.NONE) AccentGreen.copy(alpha = 0.15f) else PrimaryBlack
+                                                    ),
+                                                    border = BorderStroke(1.dp, if (selectedMediaOption == com.noslop.app.data.BackupMediaOption.NONE) AccentGreen else BorderSubtle)
+                                                ) {
+                                                    Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                                                        RadioButton(
+                                                            selected = selectedMediaOption == com.noslop.app.data.BackupMediaOption.NONE,
+                                                            onClick = { selectedMediaOption = com.noslop.app.data.BackupMediaOption.NONE },
+                                                            colors = RadioButtonDefaults.colors(selectedColor = AccentGreen)
+                                                        )
+                                                        Spacer(modifier = Modifier.width(6.dp))
+                                                        Column {
+                                                            Text("IDs & Keys Only (Lightweight)".tr, fontWeight = FontWeight.Bold, color = TextLight, fontSize = 13.sp)
+                                                            Text("Keys, contacts, groups & database (~100 KB). Fast & media re-syncs from peers.".tr, color = TextMuted, fontSize = 11.sp)
+                                                        }
+                                                    }
+                                                }
+
+                                                Spacer(modifier = Modifier.height(8.dp))
+
+                                                // Option 2: Full Backup (Owned Media Included)
+                                                Card(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .clickable { selectedMediaOption = com.noslop.app.data.BackupMediaOption.OWNED_ONLY },
+                                                    colors = CardDefaults.cardColors(
+                                                        containerColor = if (selectedMediaOption == com.noslop.app.data.BackupMediaOption.OWNED_ONLY) AccentGreen.copy(alpha = 0.15f) else PrimaryBlack
+                                                    ),
+                                                    border = BorderStroke(1.dp, if (selectedMediaOption == com.noslop.app.data.BackupMediaOption.OWNED_ONLY) AccentGreen else BorderSubtle)
+                                                ) {
+                                                    Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                                                        RadioButton(
+                                                            selected = selectedMediaOption == com.noslop.app.data.BackupMediaOption.OWNED_ONLY,
+                                                            onClick = { selectedMediaOption = com.noslop.app.data.BackupMediaOption.OWNED_ONLY },
+                                                            colors = RadioButtonDefaults.colors(selectedColor = AccentGreen)
+                                                        )
+                                                        Spacer(modifier = Modifier.width(6.dp))
+                                                        Column {
+                                                            Text("Full Backup (Owned Media Included)".tr, fontWeight = FontWeight.Bold, color = TextLight, fontSize = 13.sp)
+                                                            Text("Keys, database, and all media created by your node.".tr, color = TextMuted, fontSize = 11.sp)
+                                                        }
+                                                    }
+                                                }
+
+                                                Spacer(modifier = Modifier.height(12.dp))
+                                            } else {
+                                                Text("Please enter your Word Cloud password to decrypt the backup archive:".tr, color = TextMuted)
+                                                Spacer(modifier = Modifier.height(8.dp))
+                                            }
+
+                                            OutlinedTextField(
+                                                value = mnemonicInput,
+                                                onValueChange = { mnemonicInput = it },
+                                                label = { Text("Word Cloud (Mnemonic)".tr) },
+                                                colors = OutlinedTextFieldDefaults.colors(
+                                                    focusedBorderColor = AccentGreen,
+                                                    unfocusedBorderColor = BorderSubtle,
+                                                    focusedTextColor = TextLight,
+                                                    unfocusedTextColor = TextLight
+                                                )
+                                            )
+                                        }
+                                    },
+                                    confirmButton = {
+                                        Button(
+                                            onClick = {
+                                                val mnemonicToVerify = mnemonicInput.trim()
+                                                val mediaOpt = selectedMediaOption
+                                                scope.launch {
+                                                    // R5b: compared in canonical form (case and spacing ignored); a real
+                                                    // difference is shown with its size and left to the user, instead of a
+                                                    // dead end that made backing up impossible.
+                                                    val check = if (isExporting) viewModel.checkWordCloud(mnemonicToVerify) else com.noslop.app.data.WordCloudCheck.NothingStored
+                                                    if (check is com.noslop.app.data.WordCloudCheck.Differs) {
+                                                        showMnemonicDialog = false
+                                                        mismatchMediaOption = mediaOpt
+                                                        wordCloudMismatch = check
+                                                    } else {
+                                                        showMnemonicDialog = false
+                                                        if (isExporting) {
+                                                            val prefix = if (mediaOpt == com.noslop.app.data.BackupMediaOption.NONE) "noslop_keys_" else "noslop_full_"
+                                                            val exportTimestamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())
+                                                            exportLauncher.launch("$prefix$exportTimestamp.zip")
+                                                        } else {
+                                                            importLauncher.launch(arrayOf("application/zip"))
+                                                        }
+                                                    }
+                                                }
+                                            },
+                                            enabled = mnemonicInput.isNotBlank(),
+                                            colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = PrimaryBlack)
+                                        ) {
+                                            Text(if (isExporting) "Export File".tr else "Select File".tr, fontWeight = FontWeight.Bold)
+                                        }
+                                    },
+                                    dismissButton = {
+                                        TextButton(onClick = { showMnemonicDialog = false }) {
+                                            Text("Cancel".tr, color = TextMuted)
+                                        }
+                                    },
+                                    containerColor = SurfaceDark,
+                                    titleContentColor = TextLight
+                                )
+                            }
+
+                            // ─── R5b: typed Word Cloud differs from the stored one ───
+                            wordCloudMismatch?.let { mismatch ->
+                                AlertDialog(
+                                    onDismissRequest = { wordCloudMismatch = null },
+                                    title = { Text("Word Cloud Differs".tr, color = TemporaryAmber, fontWeight = FontWeight.Bold) },
+                                    text = {
+                                        Text(
+                                            com.noslop.app.util.LanguageManager.translate("The words you typed differ from the Word Cloud saved on this device in {count} of {total} places. The backup is encrypted with the words you typed and will open only with exactly those words. Continue only if they are the words you have written down.")
+                                                .replace("{count}", mismatch.differingWords.toString())
+                                                .replace("{total}", maxOf(mismatch.storedWords, mismatch.typedWords).toString()),
+                                            color = TextMuted
+                                        )
+                                    },
+                                    confirmButton = {
+                                        Button(
+                                            onClick = {
+                                                wordCloudMismatch = null
+                                                val prefix = if (mismatchMediaOption == com.noslop.app.data.BackupMediaOption.NONE) "noslop_keys_" else "noslop_full_"
+                                                val exportTimestamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US).format(java.util.Date())
+                                                exportLauncher.launch("$prefix$exportTimestamp.zip")
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = TemporaryAmber, contentColor = PrimaryBlack)
+                                        ) {
+                                            Text("Back Up With These Words".tr, fontWeight = FontWeight.Bold)
+                                        }
+                                    },
+                                    dismissButton = {
+                                        TextButton(onClick = {
+                                            wordCloudMismatch = null
+                                            showMnemonicDialog = true
+                                        }) {
+                                            Text("Re-enter Words".tr, color = AccentGreen)
+                                        }
+                                    },
+                                    containerColor = SurfaceDark
+                                )
+                            }
+
+                            // ─── Import Destructive Warning ───
+                            if (showImportWarning && pendingImportUri != null) {
+                                AlertDialog(
+                                    onDismissRequest = { showImportWarning = false; pendingImportUri = null },
+                                    title = {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Icon(Icons.Default.Warning, contentDescription = null, tint = DestructiveRed, modifier = Modifier.size(24.dp))
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text("Destructive Import".tr, color = DestructiveRed, fontWeight = FontWeight.Bold)
+                                        }
+                                    },
+                                    text = {
+                                        Column {
+                                            Text(
+                                                "This will permanently wipe your current identity, keys, contacts, and all data. ".tr +
+                                                "The selected backup will be imported in its place.".tr,
+                                                color = TextMuted
+                                            )
+                                            Spacer(modifier = Modifier.height(8.dp))
+                                            Text(
+                                                "The app will restart automatically after import.".tr,
+                                                color = TextLight,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                    },
+                                    confirmButton = {
+                                        Button(
+                                            onClick = {
+                                                showImportWarning = false
+                                                importStatus = "Importing..."
+                                                val uriToImport = pendingImportUri!!
+                                                val mnemonicToUse = mnemonicInput
+                                                viewModel.importBackupFromUri(
+                                                    context,
+                                                    mnemonicToUse,
+                                                    uriToImport,
+                                                    allowLegacyUnauthenticated = false,
+                                                    onLegacyDetected = {
+                                                        pendingLegacyImportUri = uriToImport
+                                                        pendingLegacyMnemonic = mnemonicToUse
+                                                        showLegacyConfirmDialog = true
+                                                        importStatus = "Legacy archive detected. Confirmation required."
+                                                    },
+                                                    onFailed = { reason ->
+                                                        importStatus = com.noslop.app.util.LanguageManager.translate("Import failed: {reason}").replace("{reason}", reason)
+                                                    }
+                                                ) { success ->
+                                                    if (!success) {
+                                                        importStatus = "Import failed. Check password and file."
+                                                    }
+                                                }
+                                                mnemonicInput = ""
+                                                pendingImportUri = null
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = DestructiveRed, contentColor = Color.White)
+                                        ) {
+                                            Text("Wipe & Import".tr, fontWeight = FontWeight.Bold)
+                                        }
+                                    },
+                                    dismissButton = {
+                                        TextButton(onClick = { showImportWarning = false; pendingImportUri = null }) {
+                                            Text("Cancel".tr, color = AccentGreen)
+                                        }
+                                    },
+                                    containerColor = SurfaceDark
+                                )
+                            }
+
+                            if (showExportSuccessDialog) {
+                                AlertDialog(
+                                    onDismissRequest = { showExportSuccessDialog = false },
+                                    containerColor = SurfaceDark,
+                                    title = {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = AccentGreen, modifier = Modifier.size(24.dp))
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text("Backup Exported".tr, color = TextLight, fontWeight = FontWeight.Bold)
+                                        }
+                                    },
+                                    text = {
+                                        Text("The backup exported successfully!".tr, color = TextMuted)
+                                    },
+                                    confirmButton = {
+                                        Button(
+                                            onClick = { showExportSuccessDialog = false },
+                                            colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = PrimaryBlack)
+                                        ) {
+                                            Text("OK".tr, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                )
+                            }
+
+                            if (showLegacyConfirmDialog && pendingLegacyImportUri != null) {
+                                AlertDialog(
+                                    onDismissRequest = {
+                                        showLegacyConfirmDialog = false
+                                        pendingLegacyImportUri = null
+                                        pendingLegacyMnemonic = ""
+                                    },
+                                    containerColor = SurfaceDark,
+                                    title = {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Icon(Icons.Default.Warning, contentDescription = null, tint = TemporaryAmber, modifier = Modifier.size(24.dp))
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text("Legacy Unauthenticated Backup".tr, color = TemporaryAmber, fontWeight = FontWeight.Bold)
+                                        }
+                                    },
+                                    text = {
+                                        Column {
+                                            Text(
+                                                "This backup uses legacy AES-CBC encryption without an AEAD authentication tag (predates NoSlop authenticated backups). ".tr +
+                                                "Its authenticity and integrity cannot be mathematically verified. ".tr +
+                                                "Do you want to proceed with importing this legacy archive?".tr,
+                                                color = TextMuted
+                                            )
+                                            Spacer(modifier = Modifier.height(8.dp))
+                                            Text(
+                                                "The app will restart automatically after import.".tr,
+                                                color = TextLight,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                    },
+                                    confirmButton = {
+                                        Button(
+                                            onClick = {
+                                                showLegacyConfirmDialog = false
+                                                val uri = pendingLegacyImportUri!!
+                                                val mnemonic = pendingLegacyMnemonic
+                                                pendingLegacyImportUri = null
+                                                pendingLegacyMnemonic = ""
+                                                importStatus = "Importing legacy backup..."
+                                                viewModel.importBackupFromUri(
+                                                    context,
+                                                    mnemonic,
+                                                    uri,
+                                                    allowLegacyUnauthenticated = true,
+                                                    onFailed = { reason ->
+                                                        importStatus = com.noslop.app.util.LanguageManager.translate("Import failed: {reason}").replace("{reason}", reason)
+                                                    }
+                                                ) { success ->
+                                                    if (!success) {
+                                                        importStatus = "Legacy import failed. Check password and file."
+                                                    }
+                                                }
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = TemporaryAmber, contentColor = PrimaryBlack)
+                                        ) {
+                                            Text("Proceed with Import".tr, fontWeight = FontWeight.Bold)
+                                        }
+                                    },
+                                    dismissButton = {
+                                        TextButton(onClick = {
+                                            showLegacyConfirmDialog = false
+                                            pendingLegacyImportUri = null
+                                            pendingLegacyMnemonic = ""
+                                            importStatus = null
+                                        }) {
+                                            Text("Cancel".tr, color = AccentGreen)
+                                        }
+                                    }
+                                )
+                            }
+
+                            if (importStatus != null) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(importStatus!!.tr, color = if (importStatus!!.contains("failed")) DestructiveRed else AccentGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
+
+                            Button(
+                                onClick = { showFactoryResetConfirm = true },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.buttonColors(containerColor = DestructiveRed, contentColor = TextLight)
+                            ) {
+                                Icon(Icons.Default.Warning, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("FACTORY RESET".tr, fontWeight = FontWeight.Bold)
+                            }
+
+                            if (showFactoryResetConfirm) {
+                                AlertDialog(
+                                    onDismissRequest = { showFactoryResetConfirm = false },
+                                    title = { Text("Nuclear Option".tr) },
+                                    text = { Text("This will wipe all your keys, contacts, settings, and feed data. It cannot be undone without a backup mnemonic. Are you sure?".tr, color = TextMuted) },
+                                    confirmButton = {
+                                        TextButton(
+                                            onClick = {
+                                                showFactoryResetConfirm = false
+                                                viewModel.factoryReset()
+                                            }
+                                        ) {
+                                            Text("WIPE EVERYTHING".tr, color = DestructiveRed, fontWeight = FontWeight.Bold)
+                                        }
+                                    },
+                                    dismissButton = {
+                                        TextButton(onClick = { showFactoryResetConfirm = false }) {
+                                            Text("Cancel".tr, color = AccentGreen)
+                                        }
+                                    },
+                                    containerColor = SurfaceDark,
+                                    titleContentColor = TextLight
+                                )
+                            }
+                        }
+                    }
+                }
+                item {
+                    TextButton(
+                        onClick = { showAboutModal = true },
+                        modifier = Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 32.dp)
+                    ) {
+                        Text("About NoSlop".tr, color = TextMuted)
+                    }
+                } // End Tab 3
+                }
+
+                if (currentTab == "studio") {
+                    item {
+                        CreatorStudioTab(viewModel = viewModel)
+                    }
+                }
+            }
+        }
+    }
+
+    if (showDonationModal) {
+        AlertDialog(
+            onDismissRequest = { showDonationModal = false },
+            containerColor = SurfaceDark,
+            title = {
+                Text("Support NoSlop".tr, color = TextLight, fontWeight = FontWeight.Bold)
+            },
+            text = {
+                Column {
+                    Text("NoSlop is entirely free and open-source. If you enjoy using it, consider buying Gabby (the founder) a coffee! Your support helps cover development time.".tr, color = TextMuted, fontSize = 14.sp)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("Even \$1 makes a difference!".tr, color = TextLight, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Spacer(modifier = Modifier.height(24.dp))
+
+                    Button(
+                        onClick = {
+                            context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://donate.stripe.com/dRmfZae1F0jNfPNfFC9fW00")))
+                            showDonationModal = false
+                        },
+                        modifier = Modifier.fillMaxWidth().height(50.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = PrimaryBlack)
+                    ) {
+                        Icon(Icons.Default.Favorite, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Buy Gabby a Coffee".tr, fontWeight = FontWeight.Bold)
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { showDonationModal = false }) {
+                    Text("Close".tr, color = TextMuted)
+                }
+            }
+        )
+    }
+
+    if (showAboutModal) {
+        val versionName = try { context.packageManager.getPackageInfo(context.packageName, 0).versionName } catch (e: Exception) { "Unknown".tr }
+        AlertDialog(
+            onDismissRequest = { showAboutModal = false },
+            containerColor = SurfaceDark,
+            title = {
+                Text("About NoSlop".tr, color = TextLight, fontWeight = FontWeight.Bold)
+            },
+            text = {
+                Column {
+                    Text("Version ".tr + versionName, color = AccentGreen, fontWeight = FontWeight.Bold)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    Text("NoSlop is a privacy-first, serverless mesh network and content aggregator. It routes all communication over Tor by default and keeps your identity cryptographically secure on your device.".tr, color = TextMuted, fontSize = 14.sp)
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Text("Resources".tr, color = TextLight, fontWeight = FontWeight.Bold)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        "GitHub Repository".tr, 
+                        color = AccentGreen, 
+                        modifier = Modifier.clickable { context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://github.com/gaborkukucska/NoSlop"))) }.padding(vertical = 4.dp)
+                    )
+                    Text(
+                        "Privacy Policy".tr, 
+                        color = AccentGreen, 
+                        modifier = Modifier.clickable { context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://github.com/gaborkukucska/NoSlop/blob/main/docs/PRIVACY_POLICY.md"))) }.padding(vertical = 4.dp)
+                    )
+
+                    // NOSLOP_SOURCE_CREDIT_V1 — the credits the sources' terms ask for.
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text("Content sources".tr, color = TextLight, fontWeight = FontWeight.Bold)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("Each slide names its source and creator. Tap the source to open the original page.".tr, color = TextMuted, fontSize = 13.sp)
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        "Made using Openverse but not endorsed or certified by Openverse.".tr,
+                        color = TextMuted,
+                        fontSize = 13.sp,
+                        modifier = Modifier.clickable { context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://openverse.org"))) }.padding(vertical = 2.dp)
+                    )
+                    Text(
+                        "Photos and videos provided by Pexels.".tr,
+                        color = AccentGreen,
+                        fontSize = 13.sp,
+                        modifier = Modifier.clickable { context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://www.pexels.com"))) }.padding(vertical = 2.dp)
+                    )
+                    Text(
+                        "Music from Jamendo, under each artist's licence.".tr,
+                        color = AccentGreen,
+                        fontSize = 13.sp,
+                        modifier = Modifier.clickable { context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://www.jamendo.com"))) }.padding(vertical = 2.dp)
+                    )
+                    Text("Images from Wikimedia Commons and Openverse are shown under each file's licence.".tr, color = TextMuted, fontSize = 13.sp, modifier = Modifier.padding(vertical = 2.dp))
+                    Text(
+                        "Source terms".tr,
+                        color = AccentGreen,
+                        modifier = Modifier.clickable { context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://github.com/gaborkukucska/NoSlop/blob/main/docs/SOURCES.md"))) }.padding(vertical = 4.dp)
+                    )
+
+                    Spacer(modifier = Modifier.height(24.dp))
+                    HorizontalDivider(color = BorderSubtle)
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Text(
+                        "Imagined by Gabor Kukucska".tr, 
+                        color = TextLight, 
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.clickable { context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://gaborkukucska.com"))) }.padding(vertical = 4.dp)
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showAboutModal = false }) {
+                    Text("Close".tr, color = TextMuted)
+                }
+            }
+        )
+    }
+
+    // NOSLOP_BACKUP_PROMPT_AFTER_UPDATE_V1: the backup popup that was here is now BackupPromptHost
+    // (ui/components/BackupPromptDialog.kt), placed once in the main screen so it shows on any tab.
+}

@@ -1,0 +1,96 @@
+// FILE: app/src/main/java/com/noslop/app/feeds/api/GuardianApiClient.kt
+package com.noslop.app.feeds.api
+
+import com.google.gson.Gson
+import com.google.gson.JsonObject
+import com.noslop.app.data.ApiKeyRepository
+import com.noslop.app.data.FeedItem
+import com.noslop.app.debug.Logger
+import com.noslop.app.feeds.FeedParser
+import okhttp3.Request
+
+/** The Guardian API client — the user's own free developer key, 500 calls a day. */
+object GuardianApiClient {
+    private const val TAG = "GUARDIAN_API"
+    private val gson = com.noslop.app.util.Json.gson
+    private val client get() = com.noslop.app.net.HttpClientProvider.activeClearnetClient
+
+    suspend fun searchArticles(query: String, section: String? = null, apiKeyRepo: ApiKeyRepository, sourceId: String = "api-guardian-search", recentOnly: Boolean = false): List<FeedItem> {
+        val apiKey = apiKeyRepo.getKey("guardian")
+        if (apiKey.isNullOrBlank()) return emptyList()
+        val sectionParam = if (section != null) "&section=$section" else ""
+        val dateParam = if (recentOnly) {
+            val cal = java.util.Calendar.getInstance()
+            cal.add(java.util.Calendar.MONTH, -3)
+            val sdf = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US)
+            "&from-date=${sdf.format(cal.time)}&order-by=newest"
+        } else ""
+        return fetch("https://content.guardianapis.com/search?q=${java.net.URLEncoder.encode(query, "UTF-8")}$sectionParam&show-fields=byline,trailText,thumbnail$dateParam", apiKey, sourceId)
+    }
+
+    /**
+     * E5s2: one page of a user search (pages numbered from 1), newest first when [newestFirst],
+     * otherwise by relevance as [searchArticles].
+     */
+    suspend fun searchArticlesPage(
+        query: String,
+        page: Int,
+        apiKeyRepo: ApiKeyRepository,
+        newestFirst: Boolean,
+        sourceId: String = "api-guardian-search"
+    ): SourcePage {
+        val apiKey = apiKeyRepo.getKey("guardian")
+        if (apiKey.isNullOrBlank()) return SourcePage.NONE
+        val order = if (newestFirst) "&order-by=newest" else ""
+        return fetchPage(
+            "https://content.guardianapis.com/search?q=${java.net.URLEncoder.encode(query, "UTF-8")}&show-fields=byline,trailText,thumbnail$order" + pageParam(page),
+            apiKey, sourceId
+        )
+    }
+
+    suspend fun searchSection(section: String, apiKeyRepo: ApiKeyRepository, sourceId: String = "api-guardian-section"): List<FeedItem> {
+        val apiKey = apiKeyRepo.getKey("guardian")
+        if (apiKey.isNullOrBlank()) return emptyList()
+        return fetch("https://content.guardianapis.com/search?section=$section&show-fields=byline,trailText,thumbnail", apiKey, sourceId)
+    }
+
+    private fun fetch(url: String, apiKey: String, sourceId: String): List<FeedItem> =
+        fetchPage(url, apiKey, sourceId).items
+
+    /** E5s2: [fetch], with whether the Guardian has a further page. */
+    private fun fetchPage(url: String, apiKey: String, sourceId: String): SourcePage {
+        return try {
+            val request = Request.Builder().url(url).header("api-key", apiKey).header("User-Agent", com.noslop.app.net.NoSlopUserAgent.value).build()
+            val response = client.newCall(request).execute()
+            val body = response.body?.string() ?: return SourcePage.failed()
+            val root = gson.fromJson(body, JsonObject::class.java)
+            val responseObj = root.getAsJsonObject("response") ?: return SourcePage.END
+            val results = responseObj.getAsJsonArray("results") ?: return SourcePage.END
+            val items = mutableListOf<FeedItem>()
+            for (el in results) {
+                try {
+                    val r = el.asJsonObject
+                    val contentId = r.get("id")?.asString ?: continue
+                    val title = r.get("webTitle")?.asString ?: continue
+                    val webUrl = r.get("webUrl")?.asString ?: continue
+                    val pubDate = try { r.get("webPublicationDate")?.asString } catch (_: Exception) { null }
+                    val fields = r.getAsJsonObject("fields")
+                    val byline = try { fields?.get("byline")?.asString } catch (_: Exception) { null }
+                    val trailText = try { fields?.get("trailText")?.asString } catch (_: Exception) { null }
+                    val thumbnail = try { fields?.get("thumbnail")?.asString } catch (_: Exception) { null }
+                    val excerpt = if (!trailText.isNullOrBlank()) stripHtml(trailText).take(300) else null
+                    items.add(FeedItem(id = "guardian_${contentId.replace("/", "_")}", sourceId = sourceId,
+                        title = title, url = webUrl, author = byline, excerpt = excerpt,
+                        thumbnailUrl = thumbnail, publishedAt = FeedParser.parseDate(pubDate),
+                        mediaUrl = null, mediaType = null,
+                        apiSource = "guardian"))
+                } catch (e: Exception) { Logger.debug(TAG, "Skipping Guardian result: ${e.message}") }
+            }
+            Logger.info(TAG, "Guardian: fetched ${items.size} articles")
+            val currentPage = responseObj.intField("currentPage") ?: 1
+            SourcePage(items, hasMore = results.size() > 0 && currentPage < (responseObj.intField("pages") ?: 0))
+        } catch (e: Exception) { Logger.error(TAG, "Guardian request failed", e.message); SourcePage.failed() }
+    }
+
+
+}

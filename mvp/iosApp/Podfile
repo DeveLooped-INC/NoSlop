@@ -1,0 +1,27 @@
+# CocoaPods integration for the iOS app — currently just Tor (iCepa Tor.framework), the only practical way
+# to embed Tor on iOS (no clean SPM option; see ADR-009). Workflow with XcodeGen:
+#   cd iosApp && xcodegen generate && pod install   # then build the .xcworkspace, not the .xcodeproj
+platform :ios, '15.0'
+
+target 'iosApp' do
+  use_frameworks!
+  pod 'Tor', '~> 409'
+end
+
+post_install do |installer|
+  installer.pods_project.targets.each do |target|
+    target.build_configurations.each do |config|
+      # Xcode "Eager Linking" generates a Tor.tbd with the same install_name as Tor.framework,
+      # which makes Tor link against itself ("Can't link a dylib with itself"). Disable it.
+      config.build_settings['EAGER_LINKING'] = 'NO'
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.0'
+    end
+  end
+
+  # The Tor xcframework slices ship with a com.apple.FinderInfo xattr on each tor.framework dir.
+  # It propagates into the embedded Tor.framework and makes codesign fail at build time with
+  # "resource fork, Finder information, or similar detritus not allowed". Strip it after every
+  # `pod install` so a fresh checkout/install can't silently reintroduce the build break.
+  tor = File.join(installer.sandbox.root, 'Tor', 'tor.xcframework')
+  system('/usr/bin/xattr', '-rc', tor) if File.exist?(tor)
+end

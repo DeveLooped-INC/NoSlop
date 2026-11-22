@@ -1,0 +1,1145 @@
+package com.noslop.app.mesh
+
+import com.noslop.app.data.PeerDao
+import com.noslop.app.debug.Logger
+import com.noslop.app.util.Constants
+import kotlinx.coroutines.*
+import java.io.File
+import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+
+object GossipService {
+    private const val TAG = "GOSSIP"
+    private const val DEFAULT_MAX_HOPS = 6
+
+    private val processedPacketIds = LinkedHashSet<String>()
+    private val senderRateLimits = ConcurrentHashMap<String, MutableList<Long>>()
+    // P1-6: Dedicated rate limits for unauthenticated/untrusted lifecycle announcements (max 5 per 60s)
+    private val announcementRateLimits = ConcurrentHashMap<String, MutableList<Long>>()
+    // Dedicated rate limits for unauthenticated directed DMs (max 10 per 60s per sender, 30 per 60s globally)
+    private val dmRateLimits = ConcurrentHashMap<String, MutableList<Long>>()
+    @Volatile private var globalUntrustedDmCount = 0
+    @Volatile private var globalUntrustedDmWindowStart = 0L
+
+    // Round B (D03): the media relay-listener registry is gone. A relay node forwarded every chunk it
+    // received for a media id (i.e. its own downloads) to whoever had registered for that id, with no
+    // access check, and multi-hop recovery could never complete anyway (the holder can only answer
+    // requesters it can reach). Recovery is now a direct-peer query answered under the media ACL
+    // (MediaManager.handleRecoveryRequest).
+
+    private val firewallBuffer = ConcurrentHashMap<String, MutableList<NetworkPacket>>()
+
+    // P1 (1.7): caps on per-sender state. Sender keys are free to mint, so without a cap a flood of
+    // distinct senders grows these maps without bound. Buffering is best-effort (new senders are simply
+    // not buffered once full); the rate-limit tables prune first and then fail closed for new senders.
+    private const val MAX_BUFFERED_SENDERS = 256
+    private const val MAX_BUFFERED_PER_SENDER = 10
+    private const val FIREWALL_BUFFER_TTL_MS = 15_000L
+    internal const val MAX_RATE_LIMITED_SENDERS = 4096
+
+    // P1 (1.8): dedup keys of buffered packets being replayed by [flushFirewallBuffer]. The release is
+    // the firewall decision for that packet, so processIncoming skips the trust check for it exactly once
+    // (a trust read that lags the handshake must not re-buffer and lose it).
+    private val releasedPacketKeys: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val senderMediaBytes = ConcurrentHashMap<String, Long>()
+
+    private val recentlyDeletedPeers = ConcurrentHashMap<String, Long>()
+    
+    data class PostContext(val isFriendsOnly: Boolean, val targetPostAuthor: String?)
+
+    suspend fun resolvePostContext(packet: NetworkPacket): PostContext {
+        if (packet.type == "POST") {
+            val postPay = packet.getPostPayload()
+            return PostContext(postPay?.privacy == "friends", postPay?.authorId)
+        }
+        if (packet.type == "EDIT_POST") {
+            val editPay = packet.getEditPostPayload()
+            return PostContext(editPay?.privacy == "friends", editPay?.authorId)
+        }
+        if (packet.type == "GROUP_MESSAGE") {
+            val groupPay = packet.getGroupMessagePayload()
+            return PostContext(groupPay?.privacy == "friends", null)
+        }
+        val targetPostId = when (packet.type) {
+            "DELETE_POST" -> packet.getDeletePostPayload()?.postId
+            "COMMENT" -> packet.getCommentPayload()?.postId
+            "EDIT_COMMENT" -> packet.getEditCommentPayload()?.postId
+            "DELETE_COMMENT" -> packet.getDeleteCommentPayload()?.postId
+            "REACTION" -> packet.getReactionPayload()?.postId
+            "VOTE" -> packet.getVotePayload()?.postId
+            "COMMENT_REACTION" -> {
+                val commId = packet.getCommentReactionPayload()?.commentId
+                commId?.let { transport?.repository?.context?.let { ctx -> com.noslop.app.data.NoSlopDatabase.getDatabase(ctx).commentDao().getCommentById(it)?.postId } }
+            }
+            "COMMENT_VOTE" -> {
+                val commId = packet.getCommentVotePayload()?.commentId
+                commId?.let { transport?.repository?.context?.let { ctx -> com.noslop.app.data.NoSlopDatabase.getDatabase(ctx).commentDao().getCommentById(it)?.postId } }
+            }
+            else -> null
+        }
+        if (!targetPostId.isNullOrBlank()) {
+            val postDao = transport?.repository?.context?.let { ctx ->
+                com.noslop.app.data.NoSlopDatabase.getDatabase(ctx).postDao()
+            }
+            val targetPost = postDao?.getPostById(targetPostId)
+            if (targetPost != null) {
+                return PostContext(targetPost.privacy == "friends", targetPost.authorPublicKeyB64)
+            }
+        }
+        return PostContext(isFriendsOnly = false, targetPostAuthor = null)
+    }
+
+    suspend fun isFriendsOnlyPacket(packet: NetworkPacket): Boolean {
+        return resolvePostContext(packet).isFriendsOnly
+    }
+
+    // Track persistent send failures to avoid spamming unreachable peers
+    private val peerSendFailures = ConcurrentHashMap<String, Pair<Int, Long>>() // count, lastFailureTime
+    private val PEER_FAILURE_THRESHOLD = 3
+    private val PEER_COOLDOWN_MS = 30 * 1000L // 30 seconds cooldown
+    // R1 (regression restore): failures only add up when they happen within 5 minutes of each other,
+    // as before 679a5a1. A 2-hour memory turned one failure per Tor restart into a permanent cooldown.
+    internal const val PEER_FAILURE_WINDOW_MS = 5 * 60 * 1000L
+    internal const val PEER_MAX_COOLDOWN_MS = 120_000L
+
+    /** Time source for the failure bookkeeping; replaced only by tests. */
+    internal var clock: () -> Long = { System.currentTimeMillis() }
+
+    /**
+     * R5: asks Tor to fetch a peer's current hidden-service descriptor (TorService.refreshOnionDescriptor,
+     * wired in by the repository). When a peer's Tor restarts (a restore, a reboot) its .onion gets new
+     * introduction points, but our Tor keeps using the cached descriptor; with our send timeouts shorter
+     * than Tor's own retry cycle, every send timed out for minutes. Null in unit tests.
+     */
+    @Volatile
+    var onionDescriptorRefresher: ((String) -> Unit)? = null
+
+    /** A descriptor is re-fetched for the same onion at most this often. */
+    internal const val DESCRIPTOR_REFRESH_INTERVAL_MS = 60_000L
+    private val descriptorRefreshedAt = ConcurrentHashMap<String, Long>()
+
+    /** R5: second failure in a row to an onion, or the peer reached us while our sends were failing. */
+    private fun maybeRefreshDescriptor(peerOnionAddress: String, reason: String) {
+        val refresher = onionDescriptorRefresher ?: return
+        if (!peerOnionAddress.endsWith(".onion")) return
+        val now = clock()
+        val last = descriptorRefreshedAt[peerOnionAddress]
+        if (last != null && now - last < DESCRIPTOR_REFRESH_INTERVAL_MS) return
+        descriptorRefreshedAt[peerOnionAddress] = now
+        Logger.info(TAG, "Refreshing hidden-service descriptor of $peerOnionAddress ($reason)")
+        try {
+            refresher(peerOnionAddress)
+        } catch (e: Exception) {
+            Logger.warn(TAG, "Descriptor refresh for $peerOnionAddress failed to start: ${e.message}")
+        }
+    }
+
+    fun recordDeletedPeer(publicKeyB64: String) {
+        recentlyDeletedPeers[publicKeyB64] = System.currentTimeMillis()
+    }
+
+    /**
+     * Record a send failure for a peer. If failures exceed threshold within window,
+     * mark peer as temporarily blocked.
+     */
+    fun recordSendFailure(peerOnionAddress: String) {
+        val now = clock()
+        val (count, lastFailureTime) = peerSendFailures[peerOnionAddress] ?: (0 to 0L)
+        
+        val effectiveCount = if (now - lastFailureTime > PEER_FAILURE_WINDOW_MS) 1 else count + 1
+        peerSendFailures[peerOnionAddress] = effectiveCount to now
+        if (effectiveCount >= 2) maybeRefreshDescriptor(peerOnionAddress, "$effectiveCount failed sends")
+        
+        if (effectiveCount >= PEER_FAILURE_THRESHOLD) {
+            val cooldownMs = cooldownFor(effectiveCount)
+            Logger.warn(TAG, "Peer $peerOnionAddress has failed $effectiveCount times. Cooldown for ${cooldownMs/1000}s")
+        }
+    }
+
+    /**
+     * Check if a peer is currently in cooldown due to repeated failures.
+     * Uses exponential backoff (30 s, 60 s, then 120 s max — see [cooldownFor]) based on the
+     * failure count within PEER_FAILURE_WINDOW_MS, so unreachable peers don't continuously burn
+     * Tor circuits.
+     */
+    fun isPeerInCooldown(peerOnionAddress: String): Boolean {
+        val (count, lastFailureTime) = peerSendFailures[peerOnionAddress] ?: return false
+        val now = clock()
+        
+        if (count >= PEER_FAILURE_THRESHOLD) {
+            if (now - lastFailureTime < cooldownFor(count)) {
+                return true
+            }
+        }
+        
+        // Clean up entries whose failure window and cooldown have both passed
+        if (now - lastFailureTime > PEER_FAILURE_WINDOW_MS + PEER_MAX_COOLDOWN_MS) {
+            peerSendFailures.remove(peerOnionAddress, count to lastFailureTime)
+        }
+        
+        return false
+    }
+
+    /** 30 s, 60 s, then 120 s max (the pre-679a5a1 schedule). */
+    private fun cooldownFor(count: Int): Long {
+        val exponent = (count - PEER_FAILURE_THRESHOLD).coerceIn(0, 3)
+        return (PEER_COOLDOWN_MS * (1 shl exponent)).coerceAtMost(PEER_MAX_COOLDOWN_MS)
+    }
+
+    /**
+     * Record a successful send to reset failure counter
+     */
+    fun recordSendSuccess(peerOnionAddress: String) {
+        val previous = peerSendFailures.remove(peerOnionAddress)
+        // R5: also called when an authenticated packet from the peer arrives. If our sends to it were
+        // failing, our copy of its descriptor is the likely cause (it can reach us; we can't reach it).
+        if (previous != null && previous.first >= 2) {
+            maybeRefreshDescriptor(peerOnionAddress, "reachable again after ${previous.first} failed sends")
+        }
+    }
+
+
+
+    /**
+     * Periodic cleanup of failure tracking data
+     */
+    private fun cleanupFailureTracking() {
+        val now = clock()
+        val iterator = peerSendFailures.entries.iterator()
+        while (iterator.hasNext()) {
+            val entry = iterator.next()
+            val (_, lastFailureTime) = entry.value
+            if (now - lastFailureTime > PEER_FAILURE_WINDOW_MS + PEER_MAX_COOLDOWN_MS) {
+                iterator.remove()
+            }
+        }
+    }
+
+    fun isPeerRecentlyDeleted(publicKeyB64: String, packetTimestamp: Long = 0L): Boolean {
+        val deletedAt = recentlyDeletedPeers[publicKeyB64] ?: return false
+        val gracePeriod = 7L * 24 * 60 * 60 * 1000L // 7 days
+        val now = System.currentTimeMillis()
+        if (now - deletedAt >= gracePeriod) {
+            recentlyDeletedPeers.remove(publicKeyB64)
+            return false
+        }
+        // If this is a fresh connection request created after deletion, allow the deliberate reconnect
+        if (packetTimestamp > deletedAt) {
+            recentlyDeletedPeers.remove(publicKeyB64)
+            return false
+        }
+        return true
+    }
+
+    /**
+     * R3: true when [packet] is a MESSAGE for a group we have stored and [senderId] is one of its
+     * members or its admin. Used only to exempt such messages from the untrusted-DM rate limit.
+     */
+    internal suspend fun isFromMemberOfStoredGroup(packet: NetworkPacket, senderId: String): Boolean {
+        if (packet.type != "MESSAGE") return false
+        val groupId = try { packet.getMessagePayload()?.groupId } catch (_: Exception) { null }
+        if (groupId.isNullOrBlank()) return false
+        return try {
+            val group = transport?.repository?.getGroupChatById(groupId) ?: return false
+            val members: List<String> = try {
+                com.noslop.app.util.Json.gson.fromJson(group.membersJson, Array<String>::class.java)?.toList() ?: emptyList()
+            } catch (_: Exception) { emptyList() }
+            senderId == group.adminPublicKeyB64 || senderId in members
+        } catch (_: Exception) { false }
+    }
+
+    /** Round B: media packet types that travel only between the two nodes involved. */
+    internal fun isPointToPointMediaType(type: String): Boolean = type.startsWith("MEDIA_")
+
+    fun resetForTesting() {
+        resetAllState()
+        clock = { System.currentTimeMillis() }
+        peerDao = null
+        transport = null
+        localPublicKeyB64 = ""
+        getMeshFilterSettings = null
+        checkEntityExists = null
+        checkIsLocalUser = null
+        pushPacketToHub = null
+        onionDescriptorRefresher = null
+        cleanupJob?.cancel()
+        cleanupJob = null
+    }
+
+    fun resetAllState() {
+        processedPacketIds.clear()
+        senderRateLimits.clear()
+        announcementRateLimits.clear()
+        dmRateLimits.clear()
+        globalUntrustedDmCount = 0
+        globalUntrustedDmWindowStart = 0L
+        firewallBuffer.clear()
+        releasedPacketKeys.clear()
+        senderMediaBytes.clear()
+        recentlyDeletedPeers.clear()
+        peerSendFailures.clear()
+        descriptorRefreshedAt.clear()
+    }
+
+
+    /**
+     * Release the MESSAGE packets buffered for [senderId] now that the sender is trusted.
+     *
+     * P1 (1.8): the buffer used to be replayed through [processIncoming] alone, which only filters and
+     * forwards — handler dispatch happens in [MeshPacketHandler.handleIncomingPacket] — so every buffered
+     * message was marked processed and then dropped for good. Each packet now goes through the full
+     * dispatch path (NoSlopRepository.handleIncomingPacket), the same entry MeshTransport uses after the
+     * envelope check that this packet already passed when it first arrived. Its dedup key is put in
+     * [releasedPacketKeys] so the replay is not re-buffered by a trust read that lags the handshake.
+     */
+    fun flushFirewallBuffer(senderId: String) {
+        val buffer = firewallBuffer.remove(senderId) ?: return
+        // Snapshot under the list's monitor: the TTL timer may still be removing from it.
+        val packets = synchronized(buffer) { buffer.toList().also { buffer.clear() } }
+        if (packets.isEmpty()) return
+        Logger.info(TAG, "Flushing ${packets.size} buffered packets for newly trusted peer $senderId")
+        scope.launch {
+            for (packet in packets) {
+                val key = dedupKey(packet)
+                releasedPacketKeys.add(key)
+                try {
+                    val repo = transport?.repository
+                    if (repo == null) {
+                        Logger.warn(TAG, "Cannot replay buffered packet ${packet.id}: transport not initialized")
+                    } else if (repo.handleIncomingPacket(packet)) {
+                        // Same bookkeeping as MeshTransport after a handled inbound packet.
+                        EnvelopeAuth.recordProcessed(packet)
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Logger.error(TAG, "Replay of buffered packet ${packet.id} failed: ${e.message}")
+                } finally {
+                    // Single use: never leave a release token behind (e.g. the dispatch dropped it early).
+                    releasedPacketKeys.remove(key)
+                }
+            }
+        }
+    }
+
+    /**
+     * Dedup key: type + id + payload digest. Keying on the bare id let any node with a valid envelope of
+     * its own (e.g. an untrusted one sending a firewall-exempt, signature-unverifiable MEDIA_* packet)
+     * reuse a victim packet's id and burn it before the real packet arrived. The same packet arriving over
+     * two relays shares type, id and payload (relays change only hops and, for most types, sender_id;
+     * neither is in the payload), so legit duplicates still dedup.
+     */
+    internal fun dedupKey(packet: NetworkPacket): String =
+        "${packet.type}|${packet.id ?: "unknown"}|${EnvelopeAuth.payloadDigest(packet.payload)}"
+
+    @Volatile private var cleanupJob: Job? = null
+
+    // P1 (1.7): written by initialize() on the startup thread, read on IO threads.
+    @Volatile private var peerDao: PeerDao? = null
+    @Volatile private var transport: MeshTransport? = null
+    @Volatile private var localPublicKeyB64: String = ""
+    @Volatile private var getMeshFilterSettings: (suspend () -> com.noslop.app.data.MeshFilterSettings)? = null
+    @Volatile private var checkEntityExists: (suspend (String, String) -> Boolean)? = null
+    /**
+     * NOSLOP_HUB_OWNER_API_V1: hands one packet to the linked Home HUB for delivery to the given onion
+     * (`hub_send`). The destination is the one this phone chose with its own routing rules; a null
+     * destination falls back to the Hub's older routing (`sync_push_packets`).
+     */
+    @Volatile var pushPacketToHub: (suspend (String?, NetworkPacket) -> Boolean)? = null
+    private val coroutineExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        Logger.error(TAG, "Uncaught coroutine exception in GossipService: ${throwable.message}", throwable.stackTraceToString())
+    }
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob() + coroutineExceptionHandler)
+
+    @Volatile private var checkIsLocalUser: (suspend (String) -> Boolean)? = null
+
+    fun initialize(
+        peerDao: PeerDao,
+        transport: MeshTransport,
+        localPublicKeyB64: String,
+        getMeshFilterSettings: (suspend () -> com.noslop.app.data.MeshFilterSettings)? = null,
+        checkEntityExists: (suspend (String, String) -> Boolean)? = null,
+        checkIsLocalUser: (suspend (String) -> Boolean)? = null
+    ) {
+        this.peerDao = peerDao
+        this.transport = transport
+        this.localPublicKeyB64 = localPublicKeyB64
+        this.getMeshFilterSettings = getMeshFilterSettings
+        this.checkEntityExists = checkEntityExists
+        this.checkIsLocalUser = checkIsLocalUser
+        
+        cleanupJob?.cancel()
+        cleanupJob = scope.launch {
+            while (isActive) {
+                delay(60_000)
+                // P1 (1.7): one failing pass must not end pruning for the rest of the process lifetime.
+                try {
+                    cleanupFailureTracking()
+                    cleanupRateLimitsAndFirewall()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Logger.error(TAG, "Periodic gossip cleanup failed: ${e.message}", e.stackTraceToString())
+                }
+            }
+        }
+    }
+
+    /**
+     * --- NOSLOP_GROUP_SYNC_DIRECT_V1 ---
+     * These packets hold a group's record in plain text: member keys, handles and onion addresses. Only
+     * members may see it, so each member gets its own copy at its own onion address and nobody passes one
+     * on: no broadcast, no gossip fallback when a send fails, no relay. A failed GROUP_INVITE or GROUP_UPDATE
+     * waits in the outbox, and a failed GROUP_SYNC waits for the member to ask again. Older builds can
+     * still gossip these, which is why relays check this as well.
+     */
+    internal fun isDirectOnly(type: String): Boolean =
+        type == "GROUP_SYNC" || type == "GROUP_INVITE" || type == "GROUP_UPDATE"
+
+
+
+    private fun cleanupRateLimitsAndFirewall() {
+        val now = System.currentTimeMillis()
+
+        pruneRateMap(senderRateLimits, now, 10_000L)
+        pruneRateMap(announcementRateLimits, now, 60_000L)
+        pruneRateMap(dmRateLimits, now, 60_000L)
+
+        for (senderId in firewallBuffer.keys.toList()) {
+            firewallBuffer.computeIfPresent(senderId) { _, list ->
+                if (synchronized(list) { list.isEmpty() }) null else list
+            }
+        }
+        senderMediaBytes.clear()
+    }
+
+    /**
+     * P1 (1.7): drop expired timestamps and empty entries. Every per-sender list is only touched inside a
+     * ConcurrentHashMap compute-family call (serialised per key) and under the list's own monitor — here
+     * and in [checkRate] — so the cleaner can no longer race a rate check (the old unlocked removeAll could
+     * throw ConcurrentModificationException, which killed the cleanup loop for good).
+     */
+    private fun pruneRateMap(map: ConcurrentHashMap<String, MutableList<Long>>, now: Long, windowMs: Long) {
+        for (key in map.keys.toList()) {
+            map.computeIfPresent(key) { _, list ->
+                synchronized(list) {
+                    list.removeAll { now - it > windowMs }
+                    if (list.isEmpty()) null else list
+                }
+            }
+        }
+    }
+
+    private enum class RateCheck { OK, LIMITED, TABLE_FULL }
+
+    /** Sliding-window rate check for [key] (at most [max] events per [windowMs]) with a bounded table. */
+    private fun checkRate(
+        map: ConcurrentHashMap<String, MutableList<Long>>,
+        key: String,
+        now: Long,
+        windowMs: Long,
+        max: Int
+    ): RateCheck {
+        if (map.size >= MAX_RATE_LIMITED_SENDERS && !map.containsKey(key)) pruneRateMap(map, now, windowMs)
+        var result = RateCheck.OK
+        map.compute(key) { _, existing ->
+            if (existing == null && map.size >= MAX_RATE_LIMITED_SENDERS) {
+                result = RateCheck.TABLE_FULL
+                return@compute null
+            }
+            val list = existing ?: ArrayList()
+            synchronized(list) {
+                list.removeAll { now - it > windowMs }
+                if (list.size >= max) result = RateCheck.LIMITED else list.add(now)
+            }
+            list
+        }
+        return result
+    }
+
+
+
+    /**
+     * NOSLOP_VERIFY_BEFORE_FORWARD_V1 — the record half of dedup, split out of
+     * processIncoming() step 2 so that only authenticated packets enter the LRU.
+     * Bounded at 1000 ids, evicting the oldest 100 on overflow (unchanged).
+     */
+    private fun markProcessed(packetId: String) {
+        // packetId is the full [dedupKey] (type|id|payload digest), not the bare id.
+        synchronized(processedPacketIds) {
+            if (processedPacketIds.contains(packetId)) return
+            if (processedPacketIds.size >= 1000) {
+                val iterator = processedPacketIds.iterator()
+                repeat(100) {
+                    if (iterator.hasNext()) {
+                        iterator.next()
+                        iterator.remove()
+                    }
+                }
+            }
+            processedPacketIds.add(packetId)
+        }
+    }
+
+
+    /**
+     * Process an incoming packet: validate, dedup, firewall, and then trigger forwarding.
+     * Returns true if packet should be processed locally.
+     */
+    suspend fun processIncoming(packet: NetworkPacket): Boolean {
+        val packetId = packet.id ?: "unknown"
+        val senderId = packet.senderId
+
+        Logger.debug(TAG, "processIncoming: Analyzing ${packet.type} packet $packetId from ${senderId.take(16)}... (hops=${packet.hops ?: DEFAULT_MAX_HOPS})")
+
+        // 1. TTL Check — drop if expired; cap incoming hops to DEFAULT_MAX_HOPS (C09)
+        val hops = (packet.hops ?: DEFAULT_MAX_HOPS).coerceIn(0, DEFAULT_MAX_HOPS)
+        if (hops <= 0) {
+            Logger.warn(TAG, "Dropping packet $packetId — TTL expired (hops == 0)")
+            return false
+        }
+
+        // Drop any traffic from blacklisted/banned nodes
+        if (transport?.repository?.isNodeBanned(senderId) == true) {
+            Logger.debug(TAG, "Dropping packet $packetId from banned node ${senderId.take(8)}...")
+            return false
+        }
+
+        // 2. Dedup — drop if already processed.
+        //
+        // --- NOSLOP_VERIFY_BEFORE_FORWARD_V1 ---
+        // This step used to CHECK and RECORD in one operation, which meant an
+        // attacker-chosen packet.id entered the LRU before anything had
+        // authenticated it. Sending a forged packet carrying an id you expect a
+        // real one to use was enough to get the real one silently dropped when
+        // it arrived. The recording half now lives in step 4.6, after the
+        // signature has been checked.
+        //
+        // The CHECK stays here rather than moving down with the record, so that
+        // the rate limiter below still counts exactly the traffic it counted
+        // before: duplicates arriving over multiple gossip paths are common at
+        // TTL 6, and making them consume the 20-per-10s budget would produce
+        // false positives.
+        //
+        // Splitting it also repairs the firewall buffer. A MESSAGE from an
+        // untrusted sender was recorded here and then buffered in step 4; when
+        // flushFirewallBuffer() replayed it after the peer became trusted, this
+        // check dropped it as a duplicate and the message was lost. It now lands.
+        //
+        // P1: keyed on type + id + payload digest ([dedupKey]), not the bare id. Verify-before-mark
+        // alone did not stop id burning: a MEDIA_* packet is firewall-exempt and signature-unverifiable
+        // here, so any node could send one under its own valid envelope with a victim packet's id.
+        val dedupKey = dedupKey(packet)
+        // A packet being replayed from the firewall buffer: the release was its firewall decision.
+        val isReleasedReplay = releasedPacketKeys.remove(dedupKey)
+        synchronized(processedPacketIds) {
+            if (processedPacketIds.contains(dedupKey)) {
+                Logger.debug(TAG, "Dropping duplicate packet: $packetId")
+                return false
+            }
+        }
+
+        // 3. Rate limit: 20 packets per sender per 10-second window
+        // Whitelist DMs, handshakes, and media/sync to ensure critical packets aren't dropped during sync bursts
+        val isMediaPacket = packet.type.startsWith("MEDIA_")
+        val isSyncPacket = packet.type.startsWith("SYNC_") || packet.type == "INVENTORY_SYNC_REQUEST" || packet.type == "DM_SYNC_REQUEST"
+        val isCriticalPacket = packet.type == "MESSAGE" || packet.type == "CONNECTION_REQUEST" || packet.type == "USER_HANDSHAKE" || packet.type == "DELETE_MESSAGE" || packet.type == "DELETE_POST" || packet.type == "DELETE_COMMENT" || packet.type == "PEER_REMOVED"
+        if (!isMediaPacket && !isSyncPacket && !isCriticalPacket) {
+            when (checkRate(senderRateLimits, senderId, System.currentTimeMillis(), 10_000L, 20)) {
+                RateCheck.OK -> Unit
+                RateCheck.LIMITED -> {
+                    Logger.warn("FIREWALL", "Rate limit exceeded for $senderId. Dropping packet $packetId.")
+                    return false
+                }
+                RateCheck.TABLE_FULL -> {
+                    Logger.warn("FIREWALL", "Rate-limit table full ($MAX_RATE_LIMITED_SENDERS senders). Dropping packet $packetId from new sender $senderId.")
+                    return false
+                }
+            }
+        }
+
+                // 4. Firewall — drop all packets from non-trusted senders except ConnectionRequest/UserHandshake/MediaRelay
+        val isGroupControl = packet.type == "GROUP_INVITE" || packet.type == "GROUP_UPDATE" || packet.type == "GROUP_DELETE" || packet.type == "GROUP_QUERY" || packet.type == "GROUP_SYNC"
+        val isConnectionPacket = packet.type == "CONNECTION_REQUEST" || packet.type == "USER_HANDSHAKE" || packet.type == "CONNECTION_REJECTED" || packet.type == "ANNOUNCE_PEER" || isGroupControl
+        val isMediaRelayPacket = packet.type.startsWith("MEDIA_") // ALL media packets bypass strict trust firewall
+        val isDiscoverable = packet.type == "ANNOUNCE_DISCOVERABLE"
+        val isIdentityUpdate = packet.type == "IDENTITY_UPDATE" || packet.type == "USER_EXIT" || packet.type == "PEER_REMOVED"
+        val isDeletePacket = packet.type == "DELETE_POST" || packet.type == "DELETE_COMMENT"
+        val isFollowPacket = packet.type == "FOLLOW" || packet.type == "UNFOLLOW"
+        val isDirectedMessageForUs = (packet.type == "MESSAGE" || packet.type == "DM_ACK") && !packet.targetUserId.isNullOrBlank() && 
+            (checkIsLocalUser?.invoke(packet.targetUserId) ?: (packet.targetUserId == localPublicKeyB64))
+
+        // Dedicated rate limit for untrusted incoming directed DMs (max 10 per 60s per sender, 30 per 60s globally)
+        if (isDirectedMessageForUs) {
+            val isTrusted = peerDao?.getPeerByPublicKey(senderId)?.isTrusted == true
+            // R3 (register R7c): a group message from a member of that group is not stranger traffic.
+            // Group members are usually not contacts (D01 keeps them at relationship NONE), group
+            // messages carry no ACK, and this limiter silently lost every message past 10/min.
+            if (!isTrusted && !isFromMemberOfStoredGroup(packet, senderId)) {
+                val now = System.currentTimeMillis()
+                synchronized(this) {
+                    if (now - globalUntrustedDmWindowStart > 60_000L) {
+                        globalUntrustedDmWindowStart = now
+                        globalUntrustedDmCount = 0
+                    }
+                    if (globalUntrustedDmCount >= 30) {
+                        Logger.warn("FIREWALL", "Global untrusted DM rate limit (30/60s) exceeded. Dropping MESSAGE $packetId.")
+                        return false
+                    }
+                    globalUntrustedDmCount++
+                }
+
+                if (checkRate(dmRateLimits, senderId, now, 60_000L, 10) != RateCheck.OK) {
+                    Logger.warn("FIREWALL", "Rate limit (10/60s) exceeded for untrusted DM sender $senderId. Dropping MESSAGE $packetId.")
+                    return false
+                }
+            }
+        }
+
+        // Dedicated rate limit for unauthenticated announcements, follows, & identity updates (5 per 60s per sender)
+        if (isDiscoverable || isIdentityUpdate || isFollowPacket) {
+            if (checkRate(announcementRateLimits, senderId, System.currentTimeMillis(), 60_000L, 5) != RateCheck.OK) {
+                Logger.warn("FIREWALL", "Announcement rate limit (5/60s) exceeded for $senderId. Dropping ${packet.type} $packetId.")
+                return false
+            }
+        }
+        
+        // Check if packet is associated with an existing local group chat
+        val isSenderInGroup = if (packet.type == "MESSAGE" || packet.type == "DELETE_MESSAGE" || packet.type == "CHAT_REACTION" || packet.type == "ANNOUNCE_PEER" || isGroupControl) {
+            try {
+                val groupDao = transport?.repository?.context?.let { ctx ->
+                    com.noslop.app.data.NoSlopDatabase.getDatabase(ctx).groupChatDao()
+                }
+                val pDao = peerDao
+
+                // Check direct group association from payload if available
+                val payloadGid = when (packet.type) {
+                    "MESSAGE" -> packet.getMessagePayload()?.groupId
+                    "DELETE_MESSAGE" -> packet.getDeleteMessagePayload()?.groupId
+                    "CHAT_REACTION" -> packet.getChatReactionPayload()?.groupId
+                    else -> null
+                }
+                if (!payloadGid.isNullOrBlank() && groupDao?.getGroupChatById(payloadGid) != null) {
+                    true
+                } else {
+                    groupDao?.getAllGroupChatsList()?.any { group ->
+                        val members: List<String> = try {
+                            com.noslop.app.util.Json.gson.fromJson(group.membersJson, Array<String>::class.java).toList()
+                        } catch (_: Exception) { emptyList() }
+                        group.adminPublicKeyB64 == senderId || 
+                        senderId in members ||
+                        pDao?.getPeerByPublicKey(senderId)?.let { p ->
+                            p.publicKeyB64 in members || group.adminPublicKeyB64 == p.publicKeyB64
+                        } == true
+                    } == true
+                }
+            } catch (_: Exception) { false }
+        } else false
+
+        val postContext = resolvePostContext(packet)
+        if (postContext.isFriendsOnly) {
+            val dao = peerDao
+            if (dao != null) {
+                val peer = dao.getPeerByPublicKey(senderId)
+                val contactSetting = transport?.repository?.getAppSetting("contact_identity_${senderId}")
+                // D01: friends-only traffic is accepted from friends (Peer.isFriend) and from the post's author.
+                val isFriendSender = peer?.isFriend == true && contactSetting != "burnable"
+                val isPostAuthor = postContext.targetPostAuthor != null && senderId == postContext.targetPostAuthor
+                if (!isFriendSender && !isPostAuthor) {
+                    Logger.warn("FIREWALL", "FIREWALL BLOCKED: Dropping friends-only ${packet.type} packet $packetId from non-direct peer $senderId (temporary/burnable)")
+                    return false
+                }
+            }
+        }
+
+        if (!isConnectionPacket && !isMediaRelayPacket && !isDiscoverable && !isIdentityUpdate && !isSyncPacket && !isDeletePacket && !isSenderInGroup && !isFollowPacket && !isDirectedMessageForUs && !isReleasedReplay) {
+            val dao = peerDao
+            if (dao != null) {
+                val peer = dao.getPeerByPublicKey(senderId)
+                if (peer == null || !peer.isTrusted) {
+                    if (packet.type == "MESSAGE") {
+                        bufferUntrustedMessage(senderId, packet)
+                    }
+                    Logger.warn("FIREWALL", "FIREWALL BLOCKED: Sender $senderId is not trusted. Dropping ${packet.type} packet $packetId")
+                    return false
+                }
+            }
+        } else if (isMediaRelayPacket) {
+            val dao = peerDao
+            // Round B: chunks of a download we started ourselves are not stranger traffic. Group members
+            // and public-media holders are usually not contacts, and capping their replies at 2 MB/min
+            // dropped the rest of any larger file (each drop costing a 90 s chunk timeout).
+            val isChunkWeAskedFor = packet.type == "MEDIA_CHUNK" &&
+                (try { packet.getMediaChunkPayload()?.mediaId } catch (_: Exception) { null })
+                    ?.let { MediaManager.isMediaDownloadingOrRecovering(it) } == true
+            if (dao != null && !isChunkWeAskedFor) {
+                val peer = dao.getPeerByPublicKey(senderId)
+                if (peer == null || !peer.isTrusted) {
+                    // P1-6: UTF-8 byte count instead of UTF-16 character length
+                    val payloadSize = packet.payload?.toString()?.toByteArray(Charsets.UTF_8)?.size ?: 0
+                    val currentBytes = senderMediaBytes.getOrDefault(senderId, 0L)
+                    val MEDIA_BYTE_LIMIT = 2 * 1024 * 1024 // 2MB per 60s window
+                    if (currentBytes + payloadSize > MEDIA_BYTE_LIMIT) {
+                        Logger.warn("FIREWALL", "Media byte limit exceeded for untrusted sender $senderId. Dropping packet ${packet.id}.")
+                        return false
+                    }
+                    senderMediaBytes[senderId] = currentBytes + payloadSize
+                }
+            }
+        }
+
+        // 4.4. Signature verification — BEFORE anything is forwarded.
+        //
+        // --- NOSLOP_VERIFY_BEFORE_FORWARD_V1 ---
+        // forwardPacket() runs further down this same function, and every
+        // per-type signature check lives in a handler that only runs AFTER
+        // processIncoming() has returned. So this node used to fan a forgery out
+        // to its entire trusted peer set, at every hop out to TTL 6, and only
+        // then reject it locally. One hostile trusted peer could turn its own
+        // 20-per-10s budget into sustained circuit load for the whole
+        // neighbourhood.
+        //
+        // MeshPacketVerifier returns UNVERIFIABLE for the types that genuinely
+        // cannot be checked here (MESSAGE, MEDIA_*, SYNC_*, TYPING,
+        // READ_RECEIPT, GROUP_UPDATE, GROUP_SYNC) and for malformed payloads, so
+        // rejecting junk remains the handler's job. Only a real signature
+        // failure stops here.
+        //
+        // The handler checks are unchanged and still run. If this gate is ever
+        // wrong, MeshPacketVerifier.enforce turns the drop off without touching
+        // this logic.
+        val verdict = MeshPacketVerifier.verify(packet)
+        if (verdict == MeshPacketVerifier.Verdict.INVALID) {
+            if (MeshPacketVerifier.enforce) {
+                Logger.warn(
+                    "SIGVERIFY",
+                    "Dropping ${packet.type} packet $packetId from ${senderId.take(16)}…: signature does not verify"
+                )
+                return false
+            }
+            Logger.warn(
+                "SIGVERIFY",
+                "${packet.type} packet $packetId failed verification but enforcement is OFF — forwarding anyway"
+            )
+        }
+
+        // 4.6. Record the id, now that the packet has survived authentication.
+        // A forgery never reaches this line, so it can no longer displace the
+        // real packet it was impersonating.
+        markProcessed(dedupKey)
+
+        // R1 (regression restore of F18, removed in 4579860): a packet from a known peer that survived
+        // authentication proves the peer is alive, so its failure cooldown is cleared.
+        peerDao?.getPeerByPublicKey(senderId)?.onionAddress?.takeIf { it.isNotBlank() }?.let {
+            recordSendSuccess(it)
+        }
+
+        // 4.5. Mesh Filters (Incoming)
+        val filterSettings = getMeshFilterSettings?.invoke() ?: com.noslop.app.data.MeshFilterSettings()
+        if (packet.type == "REACTION" || packet.type == "VOTE" || 
+            packet.type == "COMMENT_REACTION" || packet.type == "COMMENT_VOTE") {
+            var isTracked = false
+            if (checkEntityExists != null) {
+                when (packet.type) {
+                    "REACTION" -> {
+                        val pay = packet.getReactionPayload()
+                        if (pay != null && checkEntityExists!!("POST", pay.postId)) isTracked = true
+                    }
+                    "VOTE" -> {
+                        val pay = packet.getVotePayload()
+                        if (pay != null && checkEntityExists!!("POST", pay.postId)) isTracked = true
+                    }
+                    "COMMENT_REACTION" -> {
+                        val pay = packet.getCommentReactionPayload()
+                        if (pay != null && checkEntityExists!!("COMMENT", pay.commentId)) isTracked = true
+                    }
+                    "COMMENT_VOTE" -> {
+                        val pay = packet.getCommentVotePayload()
+                        if (pay != null && checkEntityExists!!("COMMENT", pay.commentId)) isTracked = true
+                    }
+                }
+            } else {
+                isTracked = true
+            }
+            if (!isTracked) {
+                Logger.info("FIREWALL", "Mesh Filter: Dropped incoming reaction packet ${packet.id} (anchor not tracked locally)")
+                return false
+            }
+        } else if (packet.type == "COMMENT") {
+            var isTracked = false
+            val pay = packet.getCommentPayload()
+            if (pay != null && checkEntityExists != null) {
+                if (checkEntityExists!!("POST", pay.postId)) isTracked = true
+            } else if (pay != null) {
+                isTracked = true
+            }
+            if (!isTracked) {
+                Logger.info("FIREWALL", "Mesh Filter: Dropped incoming comment packet ${packet.id} (anchor post not tracked locally)")
+                return false
+            }
+        } else if (packet.type == "POST") {
+            val postPay = packet.getPostPayload()
+            if (postPay != null) {
+                if (postPay.clearnetUrl != null) {
+                    if (!filterSettings.allowIncomingClearnetShares) {
+                        Logger.info("FIREWALL", "Mesh Filter: Dropped incoming clearnet share post ${packet.id}")
+                        return false
+                    }
+                } else if (postPay.mediaMetadata != null) {
+                    if (postPay.mediaMetadata.type == "image" && !filterSettings.allowIncomingImagePosts) {
+                        Logger.info("FIREWALL", "Mesh Filter: Dropped incoming image post ${packet.id}")
+                        return false
+                    } else if (postPay.mediaMetadata.type == "video" && !filterSettings.allowIncomingVideoPosts) {
+                        Logger.info("FIREWALL", "Mesh Filter: Dropped incoming video post ${packet.id}")
+                        return false
+                    }
+                } else {
+                    // Text-only post
+                    if (!filterSettings.allowIncomingTextPosts) {
+                        Logger.info("FIREWALL", "Mesh Filter: Dropped incoming text post ${packet.id}")
+                        return false
+                    }
+                }
+            }
+        }
+
+        // Round B: media packets are point-to-point. They are never gossiped: an untargeted
+        // MEDIA_REQUEST used to be processed by every node that saw it and re-broadcast to all of its
+        // peers ("MEDIA_REQUEST for unknown media" everywhere), and a MEDIA_RELAY_REQUEST went 6 hops,
+        // publishing media ids mesh-wide (D02/D03). A media packet addressed to someone else is dropped.
+        if (isPointToPointMediaType(packet.type)) {
+            val target = packet.targetUserId
+            if (target != null) {
+                val isForUs = checkIsLocalUser?.invoke(target) ?: (target == localPublicKeyB64)
+                if (!isForUs) {
+                    Logger.debug(TAG, "Dropping ${packet.type} $packetId addressed to another node (media is never relayed)")
+                    return false
+                }
+            }
+            if (packet.type == "MEDIA_RELAY_REQUEST") {
+                val relayReq = packet.getMediaRelayRequestPayload()
+                if (relayReq != null) MediaManager.handleRecoveryRequest(senderId, relayReq)
+                return false
+            }
+            return true
+        }
+
+        // 5. If it is a directed message (has targetUserId), check if it is for us
+        if (packet.targetUserId != null) {
+            val isForUs = checkIsLocalUser?.invoke(packet.targetUserId) ?: (packet.targetUserId == localPublicKeyB64)
+            val isGroupPacketForUs = if (!isForUs && (packet.type == "CHAT_REACTION" || packet.type == "DELETE_MESSAGE" || packet.type == "MESSAGE" || packet.type == "GROUP_SYNC")) {
+                val gid = when (packet.type) {
+                    "CHAT_REACTION" -> packet.getChatReactionPayload()?.groupId
+                    "DELETE_MESSAGE" -> packet.getDeleteMessagePayload()?.groupId
+                    "MESSAGE" -> packet.getMessagePayload()?.groupId
+                    "GROUP_SYNC" -> packet.getGroupSyncPayload()?.let {
+                        try { com.noslop.app.util.Json.gson.fromJson(it.groupChatJson, com.noslop.app.data.GroupChat::class.java)?.groupId } catch (_: Exception) { null }
+                    }
+                    else -> null
+                }
+                !gid.isNullOrBlank() && transport?.repository?.context?.let { ctx ->
+                    com.noslop.app.data.NoSlopDatabase.getDatabase(ctx).groupChatDao().getGroupChatById(gid) != null
+                } == true
+            } else false
+
+            if (!isForUs && !isGroupPacketForUs) {
+                // Directed at someone else, just forward it if hops > 1
+                Logger.info(TAG, "Directed ${packet.type} packet ${packetId} is not for us (target=${packet.targetUserId?.take(20)}...) — forwarding")
+                forwardPacket(packet, postContext.isFriendsOnly)
+                return false
+            } else if (!isForUs && isGroupPacketForUs) {
+                // Group reaction or delete targeting a local group: forward and also process locally!
+                Logger.info(TAG, "Group ${packet.type} packet $packetId for local group — forwarding and processing locally")
+                forwardPacket(packet, postContext.isFriendsOnly)
+            }
+        } else {
+            // Public message/post, process locally AND forward to other peers
+            
+            var shouldForward = true
+            if (postContext.isFriendsOnly) {
+                shouldForward = false
+                Logger.info(TAG, "Not forwarding ${packet.type} ${packet.id} because privacy is friends-only")
+            }
+            
+            if (shouldForward) {
+                forwardPacket(packet, postContext.isFriendsOnly)
+            }
+        }
+
+        return true
+    }
+
+
+
+
+    /**
+     * Hold a MESSAGE from a not-yet-trusted sender for [FIREWALL_BUFFER_TTL_MS] so [flushFirewallBuffer]
+     * can release it if the handshake completes in time. P1 (1.7): every list mutation happens inside a
+     * compute-family call on [firewallBuffer] (serialised per sender) and under the list's monitor, the
+     * number of buffered senders is capped, and the TTL timer drops the entry once it is empty.
+     */
+    private fun bufferUntrustedMessage(senderId: String, packet: NetworkPacket) {
+        var buffered = false
+        firewallBuffer.compute(senderId) { _, existing ->
+            if (existing == null && firewallBuffer.size >= MAX_BUFFERED_SENDERS) return@compute null
+            val buffer = existing ?: java.util.Collections.synchronizedList(mutableListOf<NetworkPacket>())
+            synchronized(buffer) {
+                if (buffer.size < MAX_BUFFERED_PER_SENDER) {
+                    buffer.add(packet)
+                    buffered = true
+                }
+            }
+            buffer
+        }
+        if (!buffered) {
+            Logger.warn("FIREWALL", "Firewall buffer full; not buffering MESSAGE ${packet.id} from $senderId")
+            return
+        }
+        Logger.info("FIREWALL", "Buffered MESSAGE packet ${packet.id} from untrusted sender $senderId for ${FIREWALL_BUFFER_TTL_MS / 1000}s")
+        scope.launch {
+            delay(FIREWALL_BUFFER_TTL_MS)
+            firewallBuffer.computeIfPresent(senderId) { _, list ->
+                synchronized(list) {
+                    list.remove(packet)
+                    if (list.isEmpty()) null else list
+                }
+            }
+        }
+    }
+
+    /**
+     * Forward to all connected peers except sender, with hops decremented by 1
+     * Re-stamp sender_id to local node ID on forward (privacy preservation)
+     */
+    private suspend fun forwardPacket(packet: NetworkPacket, isFriendsOnly: Boolean = false) {
+        if (isDirectOnly(packet.type)) {
+            Logger.debug(TAG, "Not relaying ${packet.type} ${packet.id}: it only goes straight to its target")
+            return
+        }
+        val tx = transport ?: return
+        val dao = peerDao ?: return
+        
+        // NOSLOP_HUB_OWNER_API_V1: with a Home HUB linked, relaying follows the same rules as without one;
+        // each copy goes through MeshTransport.sendPacket, which hands it to the Hub with its destination.
+        // (The Hub used to be given the packet unchanged and re-broadcast it to every trusted contact,
+        // without the hop decrement and sender re-stamp below.)
+
+        if (isFriendsOnly) {
+            return
+        }
+
+        val currentHops = (packet.hops ?: DEFAULT_MAX_HOPS).coerceIn(0, DEFAULT_MAX_HOPS)
+        if (currentHops <= 1) {
+            return // Will expire on next hop
+        }
+
+        val isGroupPacket = packet.type.startsWith("GROUP_") || packet.type == "CHAT_REACTION" || packet.type == "DELETE_MESSAGE" || (packet.type == "MESSAGE" && packet.getMessagePayload()?.groupId != null)
+        val groupMemberPubs = if (isGroupPacket) {
+            try {
+                val groupDao = tx.repository.context.let { ctx ->
+                    com.noslop.app.data.NoSlopDatabase.getDatabase(ctx).groupChatDao()
+                }
+                groupDao.getAllGroupChatsList().flatMap {
+                    try { com.noslop.app.util.Json.gson.fromJson(it.membersJson, Array<String>::class.java).toList() + it.adminPublicKeyB64 } catch (_: Exception) { emptyList() }
+                }.toSet()
+            } catch (_: Exception) { emptySet() }
+        } else emptySet()
+
+        val activePeers = dao.getAllPeersList()
+        val peersToForward = activePeers.filter { 
+            it.publicKeyB64 != packet.senderId && it.publicKeyB64 != localPublicKeyB64 && 
+            (it.isTrusted || it.publicKeyB64 in groupMemberPubs) && 
+            it.onionAddress.isNotBlank()
+        }
+
+        if (peersToForward.isEmpty()) return
+
+        Logger.info(TAG, "Gossip forward: Relaying packet ${packet.id} to ${peersToForward.size} peers. Hops remaining: ${currentHops - 1}")
+
+        // Prepare forwarded copy
+        val forwardedPacket = NetworkPacket(
+            id = packet.id,
+            hops = currentHops - 1,
+            senderId = if (preservesOriginalSender(packet.type)) packet.senderId else localPublicKeyB64,
+            targetUserId = packet.targetUserId,
+            signature = packet.signature,
+            type = packet.type,
+            payload = packet.payload,
+            // C09 (E2): a relay that keeps the original sender keeps that sender's envelope signature
+            // (`hops` is not covered). A relay stamped with our key is signed again by MeshTransport.
+            envV = packet.envV,
+            envTs = packet.envTs,
+            envSig = packet.envSig
+        )
+        val router = tx.repository.identityRouter
+        val creatorPub = if (preservesOriginalSender(packet.type)) null else tx.repository.getBurnableIdentity()?.publicKeyB64
+
+        for (peer in peersToForward) {
+            // Skip peers that are in cooldown due to repeated failures
+            if (isPeerInCooldown(peer.onionAddress)) {
+                Logger.debug(TAG, "Skipping forward to ${peer.onionAddress}: peer in cooldown")
+                continue
+            }
+            
+            scope.launch {
+                // D04: we relay as the identity this peer knows. The relay used to be stamped with the
+                // personal key for everyone, which handed creator contacts our personal key.
+                val outbound = if (creatorPub != null && router.knowsUsAsCreator(peer.publicKeyB64, peer)) {
+                    forwardedPacket.copy(senderId = creatorPub)
+                } else {
+                    forwardedPacket
+                }
+                tx.sendPacket(peer.onionAddress, Constants.MESH_PORT, outbound)
+            }
+        }
+    }
+
+    /**
+     * Packet types whose envelope keeps the original sender when relayed (the receiver needs it, e.g. to
+     * decrypt a DM or to check group membership). All other relayed packets carry the relaying node.
+     */
+    internal fun preservesOriginalSender(type: String): Boolean =
+        type == "MESSAGE" || type == "ANNOUNCE_DISCOVERABLE" || type == "CHAT_REACTION" ||
+            type == "DELETE_MESSAGE" || type.startsWith("GROUP_")
+
+    /**
+     * D04: packets that only make sense from the identity a peer knows: presence, profile, exit, follow,
+     * removal. They are never sent across identities, not even dressed as a relay.
+     */
+    internal fun isSameIdentityOnlyType(type: String): Boolean =
+        type == "ANNOUNCE_PEER" || type == "IDENTITY_UPDATE" || type == "USER_EXIT" ||
+            type == "FOLLOW" || type == "UNFOLLOW" || type == "PEER_REMOVED"
+
+    /**
+     * D04: what one of our own broadcasts looks like to [peer], or null when that peer must not get it
+     * directly. [peerKnowsCreator] says whether the peer knows us by our creator identity
+     * ([com.noslop.app.data.IdentityRouter.knowsUsAsCreator]).
+     *
+     *  - Written by our personal identity, for a creator contact: not sent. A creator contact used to
+     *    receive our personal posts, comments, reactions, presence (with the personal onion) and
+     *    profile directly from the creator node, with the envelope re-stamped, which linked the two.
+     *  - Written by our creator identity, for a contact who knows our personal identity: sent exactly
+     *    as a relay of someone else's packet would be (hop count one lower; envelope = the relaying
+     *    node, or the original sender for the types a relay keeps it for), so a friend cannot tell it
+     *    from a relayed creator post. It used to go out re-stamped with the personal key as an original.
+     *    Presence and profile packets ([isSameIdentityOnlyType]) are not sent.
+     *  - Otherwise: the envelope names the identity the peer knows (as before).
+     */
+    internal fun outboundFor(
+        packet: NetworkPacket,
+        peerKnowsCreator: Boolean,
+        mainPub: String?,
+        creatorPub: String?
+    ): NetworkPacket? {
+        val routedPub = (if (peerKnowsCreator) creatorPub else mainPub) ?: return null
+        val writtenByMain = mainPub != null && packet.senderId == mainPub
+        val writtenByCreator = creatorPub != null && packet.senderId == creatorPub
+        return when {
+            writtenByMain && peerKnowsCreator -> null
+            writtenByCreator && !peerKnowsCreator -> {
+                if (isSameIdentityOnlyType(packet.type)) return null
+                packet.copy(
+                    senderId = if (preservesOriginalSender(packet.type)) packet.senderId else routedPub,
+                    hops = ((packet.hops ?: DEFAULT_MAX_HOPS).coerceIn(1, DEFAULT_MAX_HOPS) - 1).coerceAtLeast(1)
+                )
+            }
+            packet.senderId == routedPub -> packet
+            else -> packet.copy(senderId = routedPub)
+        }
+    }
+
+    /**
+     * Outbound broadcast originating from us
+     */
+    suspend fun broadcast(packet: NetworkPacket) {
+        if (isDirectOnly(packet.type)) {
+            Logger.warn(TAG, "Not broadcasting ${packet.type} ${packet.id}: it only goes straight to its target")
+            return
+        }
+        val tx = transport ?: return
+        
+        // NOSLOP_HUB_OWNER_API_V1: with a Home HUB linked, the broadcast is still worked out here, peer by
+        // peer (friends-only, groups, which identity each peer knows); MeshTransport.sendPacket hands every
+        // copy to the Hub with its destination. The Hub used to receive one copy and send it, unchanged,
+        // to every trusted contact, which ignored those rules.
+
+        val dao = peerDao ?: return
+        val isGroupPacket = packet.type.startsWith("GROUP_") || packet.type == "CHAT_REACTION" || packet.type == "DELETE_MESSAGE" || (packet.type == "MESSAGE" && packet.getMessagePayload()?.groupId != null)
+        val groupMemberPubs = if (isGroupPacket) {
+            try {
+                val groupDao = tx.repository.context.let { ctx ->
+                    com.noslop.app.data.NoSlopDatabase.getDatabase(ctx).groupChatDao()
+                }
+                groupDao.getAllGroupChatsList().flatMap {
+                    try { com.noslop.app.util.Json.gson.fromJson(it.membersJson, Array<String>::class.java).toList() + it.adminPublicKeyB64 } catch (_: Exception) { emptyList() }
+                }.toSet()
+            } catch (_: Exception) { emptySet() }
+        } else emptySet()
+
+        val postContext = resolvePostContext(packet)
+        val isFriendsOnly = postContext.isFriendsOnly
+        val targetPostAuthor = postContext.targetPostAuthor
+        val activePeers = dao.getAllPeersList()
+        val targetPeers = if (isFriendsOnly) {
+            activePeers.filter { peer ->
+                val contactSetting = tx.repository.getAppSetting("contact_identity_${peer.publicKeyB64}")
+                // D01: friends-only content goes to friends only (plus the author of the post it belongs to).
+                val isFriendTarget = peer.isFriend && contactSetting != "burnable"
+                val isPostAuthor = targetPostAuthor != null && peer.publicKeyB64 == targetPostAuthor
+                (isFriendTarget || (isPostAuthor && peer.isTrusted)) &&
+                    peer.publicKeyB64 != localPublicKeyB64 &&
+                    peer.onionAddress.isNotBlank()
+            }
+        } else {
+            activePeers.filter { (it.isTrusted || it.publicKeyB64 in groupMemberPubs) && it.publicKeyB64 != localPublicKeyB64 && it.onionAddress.isNotBlank() }
+        }
+
+        if (targetPeers.isEmpty()) {
+            Logger.debug(TAG, "No eligible peers connected to broadcast packet ${packet.id} (isFriendsOnly=$isFriendsOnly)")
+            return
+        }
+
+        Logger.info(TAG, "Gossip broadcast: Spreading original packet ${packet.id} of type ${packet.type} to ${targetPeers.size} peers (isFriendsOnly=$isFriendsOnly).")
+        
+        // Only unsolicited background presence announcements skip peers in cooldown.
+        // User posts, comments, reactions, votes, edits, deletes, and sync requests must always broadcast.
+        val isPresenceAnnounce = packet.type == "ANNOUNCE_PEER" || packet.type == "ANNOUNCE_DISCOVERABLE"
+
+        for (peer in targetPeers) {
+            if (isPresenceAnnounce && isPeerInCooldown(peer.onionAddress)) {
+                Logger.debug(TAG, "Skipping broadcast of ${packet.type} to ${peer.onionAddress}: peer in cooldown")
+                continue
+            }
+            
+            scope.launch {
+                // E4: a GROUP_QUERY names its requester in the payload, and the answering node requires the
+                // requester to be the sender (G1). Re-stamping its sender per peer (the group rule below) made
+                // the answer a refusal for every peer that knows our other identity. It takes the D04 route
+                // instead (outboundFor): sent unchanged, as a relay that keeps its sender, or not at all.
+                val outboundPacket = if ((isGroupPacket && packet.type != "GROUP_QUERY") || isFriendsOnly) {
+                    // Group and friends-only traffic keeps its existing per-peer envelope rule.
+                    val peerIdentitySetting = tx.repository.getAppSetting("contact_identity_${peer.publicKeyB64}")
+                    val isCreatorTraffic = tx.repository.getAppSetting("is_creator_enabled") == "true"
+                    val peerSenderId = if (!isFriendsOnly && (peerIdentitySetting == "burnable" || (isCreatorTraffic && peer.isTemporary))) {
+                        tx.repository.getBurnableIdentity()?.publicKeyB64 ?: packet.senderId
+                    } else {
+                        tx.repository.getLocalIdentity()?.publicKeyB64 ?: packet.senderId
+                    }
+                    if (packet.senderId != peerSenderId) packet.copy(senderId = peerSenderId) else packet
+                } else {
+                    outboundFor(
+                        packet,
+                        peerKnowsCreator = tx.repository.identityRouter.knowsUsAsCreator(peer.publicKeyB64, peer),
+                        mainPub = tx.repository.getLocalIdentity()?.publicKeyB64,
+                        creatorPub = tx.repository.getBurnableIdentity()?.publicKeyB64
+                    )
+                }
+                if (outboundPacket == null) {
+                    Logger.debug(TAG, "Not sending ${packet.type} ${packet.id} to ${peer.publicKeyB64.take(12)}: written by the identity this peer doesn't know")
+                    return@launch
+                }
+                tx.sendPacket(peer.onionAddress, Constants.MESH_PORT, outboundPacket)
+            }
+        }
+    }
+}

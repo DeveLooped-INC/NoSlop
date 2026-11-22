@@ -1,0 +1,2479 @@
+// FILE: app/src/main/java/com/noslop/app/ui/components/VideoPlayer.kt
+package com.noslop.app.ui.components
+
+import com.noslop.app.util.tr
+
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.zIndex
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.launch
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import coil.compose.AsyncImage
+import com.noslop.app.debug.Logger
+import com.noslop.app.feeds.api.YouTubeInternalClient
+import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import kotlinx.coroutines.Dispatchers
+import com.noslop.app.net.HttpClientProvider
+import com.noslop.app.ui.PreloadManager
+import com.noslop.app.ui.theme.*
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
+
+internal sealed class VideoSource {
+    data class Direct(val url: String) : VideoSource()
+    data class Embed(val url: String) : VideoSource()
+    object Unavailable : VideoSource()
+}
+
+// --- NOSLOP_EXPIRY_FIX_V1 -------------------------------------------------
+// Resolved media URLs are NOT permanent. googlevideo.com / vimeocdn.com and
+// most signed CDN links carry an `expire=<epoch>` parameter and start
+// returning 403/410 (or an HTML error body) once it passes. The old cache
+// held a resolved VideoSource forever, so if the user lingered on preceding
+// slides the feed would hand a long-dead URL to ExoPlayer on arrival.
+//
+// Every cache entry now carries an expiry and is re-resolved once stale.
+// --- NOSLOP_ROUTE_AWARE_CACHE_V1 ---
+// An expiry is not enough. A signed CDN URL is bound to the IP that resolved
+// it, so it is dead the moment the route changes — while its `expire=` stamp
+// still says it has hours left. Two more facts are recorded with every entry:
+//
+//   overTor            the routing mode in force at resolve time. A URL signed
+//                      for the device's own address cannot be fetched through
+//                      Tor, and one signed for an exit cannot be fetched
+//                      directly. Either way, a toggle invalidates.
+//   streamNonce        SOCKS5 stream isolation nonce at resolve time. When a
+//                      circuit hops via nonce-bumping, previous URLs tied to
+//                      older nonces/exits become invalid.
+private class CachedSource(
+    val source: VideoSource,
+    val expiresAtMs: Long,
+    val overTor: Boolean,
+    val streamNonce: Int,
+    val videoId: String = ""
+)
+
+/**
+ * Why an entry can no longer be used, or null if it still can. Returning the
+ * reason rather than a boolean keeps the log honest about which of the three
+ * conditions fired — "expired" and "the exit moved underneath it" look
+ * identical from the outside and want different fixes.
+ */
+private fun CachedSource.stalenessReason(): String? {
+    if (expiresAtMs <= System.currentTimeMillis()) return "URL expired"
+
+    // Mesh media URLs (file:// or local proxy 127.0.0.1) are independent of Tor clearnet routing
+    if (source is VideoSource.Direct &&
+        (source.url.startsWith("file://") || source.url.contains("127.0.0.1") || source.url.contains("localhost"))) {
+        return null
+    }
+
+    val overTorNow = HttpClientProvider.useTorForClearnet
+    if (overTor != overTorNow) {
+        return if (overTorNow) {
+            "resolved over clearnet, now routing through Tor — the URL is signed for this device's own address"
+        } else {
+            "resolved over Tor, now routing direct — the URL is signed for an exit"
+        }
+    }
+
+    if (overTorNow && source is VideoSource.Direct && videoId.isNotBlank()) {
+        val currentNonce = YouTubeInternalClient.getStreamNonce(videoId)
+        if (streamNonce < currentNonce) {
+            return "circuit stream nonce advanced ($streamNonce -> $currentNonce)"
+        }
+    }
+
+    return null
+}
+
+private val sourceCache = ConcurrentHashMap<String, CachedSource>(64)
+
+fun invalidateAllOnRouteTransition() {
+    sourceCache.clear()
+    PreloadManager.evictAll()
+    YouTubeInternalClient.forgetUnplayable()
+    PreloadManager.clearUnplayable()
+    try {
+        // U10: Cancel active clearnet calls and shut down prior Coil loader
+        HttpClientProvider.rawClearnetClient.dispatcher.cancelAll()
+        val appContext = com.noslop.app.NoSlopApp.repository.context
+        val oldLoader = coil.Coil.imageLoader(appContext)
+        if (appContext is com.noslop.app.NoSlopApp) {
+            coil.Coil.setImageLoader(appContext.newImageLoader())
+        }
+        oldLoader.memoryCache?.clear()
+        oldLoader.diskCache?.clear()
+        oldLoader.shutdown()
+    } catch (e: Exception) {
+        Logger.warn("VIDEO_ROUTE", "Rebuilding the image loader failed: ${e.message}")
+    }
+    Logger.info("VIDEO_ROUTE", "Invalidated all cached sources, preloaded players, cancelled clearnet requests, and rebuilt image loader on network route transition")
+}
+
+// Re-resolve this far BEFORE the stated expiry, so a slow handshake or a
+// mid-playback range request can't land on the far side of the deadline.
+internal const val URL_EXPIRY_GUARD_MS = 45_000L
+
+// Signed URL with no parseable deadline: assume a short life.
+private const val SIGNED_URL_FALLBACK_TTL_MS = 4 * 60_000L
+// Plain static asset (an mp4 straight off an RSS feed): effectively stable.
+private const val STATIC_URL_TTL_MS = 6 * 60 * 60_000L
+// Don't let one transient network blip mark a video dead for the session.
+private const val UNAVAILABLE_TTL_MS = 60_000L
+// --- NOSLOP_MEDIA_PEERS_V1 ---
+// An Embed result is NOT a successful resolve — it is the fallback taken when
+// direct stream resolution failed or the circuit breaker was open. Caching it
+// for hours means one transient failure pins a video to the WebView player for
+// the rest of the session, hiding the fact that direct streaming has recovered.
+// Short TTL so the direct path is retried promptly.
+private const val EMBED_TTL_MS = 3 * 60_000L
+
+private val EXPIRY_QUERY_PATTERN =
+    Regex("[?&](?:expire|expires|exp)=(\\d{10,13})", RegexOption.IGNORE_CASE)
+private val EXPIRY_PATH_PATTERN =
+    Regex("/expire/(\\d{10,13})", RegexOption.IGNORE_CASE)
+private val SIGNED_URL_HINT_PATTERN = Regex(
+    "googlevideo\\.com|vimeocdn\\.com|akamaized\\.net|cloudfront\\.net|[?&]sig=|[?&]signature=|X-Amz-",
+    RegexOption.IGNORE_CASE
+)
+
+/**
+ * Wall-clock ms after which [url] should be treated as dead and re-resolved.
+ * Local files and the on-device mesh proxy never expire.
+ */
+internal fun expiryOfResolvedUrl(url: String): Long {
+    if (url.startsWith("file://")) return Long.MAX_VALUE
+    if (url.contains("127.0.0.1") || url.contains("localhost")) return Long.MAX_VALUE
+
+    val epoch = EXPIRY_QUERY_PATTERN.find(url)?.groupValues?.get(1)
+        ?: EXPIRY_PATH_PATTERN.find(url)?.groupValues?.get(1)
+    if (epoch != null) {
+        val raw = epoch.toLongOrNull()
+        if (raw != null) {
+            val ms = if (epoch.length <= 10) raw * 1000L else raw
+            return ms - URL_EXPIRY_GUARD_MS
+        }
+    }
+
+    return System.currentTimeMillis() + if (SIGNED_URL_HINT_PATTERN.containsMatchIn(url)) {
+        SIGNED_URL_FALLBACK_TTL_MS
+    } else {
+        STATIC_URL_TTL_MS
+    }
+}
+
+private fun expiryOfSource(source: VideoSource): Long = when (source) {
+    is VideoSource.Direct -> expiryOfResolvedUrl(source.url)
+    is VideoSource.Embed -> System.currentTimeMillis() + EMBED_TTL_MS
+    is VideoSource.Unavailable -> System.currentTimeMillis() + UNAVAILABLE_TTL_MS
+}
+
+
+
+private val resolveMutexes = ConcurrentHashMap<String, kotlinx.coroutines.sync.Mutex>()
+
+internal suspend fun resolveSource(rawUrl: String, forceRefresh: Boolean = false, context: android.content.Context, isPreload: Boolean = false): VideoSource {
+    val quality = com.noslop.app.NoSlopApp.repository.mediaSettingsFlow.value.videoQuality
+    val cacheKey = "$rawUrl||$quality"
+
+    fun freshOrNull(): VideoSource? {
+        val entry = sourceCache[cacheKey] ?: return null
+        // NOSLOP_ROUTE_AWARE_CACHE_V1 — expiry alone used to decide this.
+        val reason = entry.stalenessReason() ?: return entry.source
+        Logger.info("VIDEO_RESOLVE", "Cached source for $rawUrl unusable ($reason) — re-resolving")
+        sourceCache.remove(cacheKey)
+        return null
+    }
+
+    if (!forceRefresh) {
+        freshOrNull()?.let { return it }
+    } else {
+        sourceCache.remove(cacheKey)
+    }
+
+    if (!HttpClientProvider.isNetworkReady && rawUrl.startsWith("http")) {
+        Logger.info("VIDEO_RESOLVE", "Network not ready, awaiting network before resolving: $rawUrl")
+        HttpClientProvider.awaitNetworkReady(30_000L)
+    }
+
+    val mutex = resolveMutexes.computeIfAbsent(cacheKey) { kotlinx.coroutines.sync.Mutex() }
+
+    val resolveStartedMs = System.currentTimeMillis()
+    val resolved = mutex.withLock {
+        // Another coroutine may have resolved it while we waited on the lock.
+        if (!forceRefresh) {
+            freshOrNull()?.let { return@withLock it }
+        }
+        val result = doResolve(rawUrl, quality, isPreload)
+        val expiryMs = if ((result is VideoSource.Embed || result is VideoSource.Unavailable) && !HttpClientProvider.isNetworkReady) {
+            System.currentTimeMillis() + 10_000L
+        } else {
+            expiryOfSource(result)
+        }
+        // NOSLOP_ROUTE_AWARE_CACHE_V1 — stamp the route this was resolved on.
+        // Never poison sourceCache with an Unavailable result from a speculative background preload.
+        if (!(isPreload && result is VideoSource.Unavailable)) {
+            val videoId = YouTubeInternalClient.extractVideoId(rawUrl) ?: ""
+            val nonce = if (videoId.isNotBlank()) YouTubeInternalClient.getStreamNonce(videoId) else 0
+            sourceCache[cacheKey] = CachedSource(
+                source = result,
+                expiresAtMs = expiryMs,
+                overTor = HttpClientProvider.useTorForClearnet,
+                streamNonce = nonce,
+                videoId = videoId
+            )
+        }
+        result
+    }
+    // Drop the mutex only after releasing it, otherwise a concurrent caller can
+    // computeIfAbsent a *different* Mutex and resolve in parallel.
+    resolveMutexes.remove(cacheKey)
+    // --- NOSLOP_PLAYBACK_DIAG_V1 ---
+    // Time the resolve and record exactly which rendition we were handed. A
+    // stalled video can then be correlated with its itag, size and remaining
+    // URL lifetime instead of guessed at.
+    val elapsedMs = System.currentTimeMillis() - resolveStartedMs
+    when (val r = resolved) {
+        is VideoSource.Direct -> Logger.info(
+            PLAYBACK_DIAG_TAG,
+            "resolved DIRECT in ${elapsedMs}ms ${describeStreamUrl(r.url)} | $rawUrl ${Logger.redact(rawUrl)}"
+        )
+        is VideoSource.Embed -> Logger.info(
+            PLAYBACK_DIAG_TAG, "resolved EMBED in ${elapsedMs}ms | $rawUrl"
+        )
+        is VideoSource.Unavailable -> Logger.warn(
+            PLAYBACK_DIAG_TAG, "resolved UNAVAILABLE in ${elapsedMs}ms | $rawUrl ${Logger.redact(rawUrl)}"
+        )
+    }
+    return resolved
+}
+
+private suspend fun doResolve(rawUrl: String, quality: String, isPreload: Boolean): VideoSource = withContext(Dispatchers.IO) {
+    if (rawUrl.isBlank()) return@withContext VideoSource.Unavailable
+
+    if (HttpClientProvider.useTorForClearnet && !HttpClientProvider.isNetworkReady && !rawUrl.startsWith("file://") && !rawUrl.contains("127.0.0.1") && !rawUrl.contains("localhost") && !rawUrl.startsWith("noslop://")) {
+        Logger.warn("VIDEO_RESOLVE", "Tor is disconnected and Clearnet over Tor is ENABLED. Refusing stream resolution for privacy: $rawUrl")
+        return@withContext VideoSource.Unavailable
+    }
+
+    if ((rawUrl.contains("127.0.0.1") || rawUrl.contains("localhost")) && 
+        rawUrl.substringAfter("id=", "").substringBefore("&").isBlank()) {
+        Logger.warn("VIDEO_RESOLVE", "Caught invalid local proxy URL with blank ID: $rawUrl")
+        return@withContext VideoSource.Unavailable
+    }
+
+    if (isImageUrl(rawUrl)) {
+        Logger.warn("VIDEO_RESOLVE", "Caught image URL passed to VideoPlayer, marking unavailable: $rawUrl")
+        return@withContext VideoSource.Unavailable
+    }
+
+    val result = when {
+        isDirectFileUrl(rawUrl) -> {
+            // NOSLOP_MEDIA_ENCRYPTION_V1: the player cannot read a file that is encrypted on the device.
+            // Such a file is played through the local media server, which decrypts as it streams.
+            val playable = com.noslop.app.ui.playableMediaUrl(rawUrl)
+            if (playable != rawUrl) {
+                Logger.info("VIDEO_RESOLVE", "Local file is encrypted, playing it through the local media server")
+                return@withContext VideoSource.Direct(playable)
+            }
+            if (rawUrl.contains("127.0.0.1") || rawUrl.contains("localhost")) {
+                val id = rawUrl.substringAfter("id=").substringBefore("&")
+                if (id.isNotBlank()) {
+                    val localFile = com.noslop.app.mesh.MediaManager.getLocalFile(id, "video")
+                    // Only a plain file can skip the server.
+                    if (localFile != null && localFile.exists() && !com.noslop.app.mesh.MediaCrypto.isEncrypted(localFile)) {
+                        Logger.info("VIDEO_RESOLVE", "Found local file, bypassing proxy: ${localFile.absolutePath}")
+                        return@withContext VideoSource.Direct("file://${localFile.absolutePath}")
+                    }
+                }
+            }
+            VideoSource.Direct(rawUrl)
+        }
+        isYouTubeUrl(rawUrl) -> resolveYouTubeSource(rawUrl, quality, isPreload)
+        isVimeoUrl(rawUrl) -> resolveVimeoSource(rawUrl, quality)
+        rawUrl.contains("archive.org/embed") || rawUrl.contains("archive.org/details") -> {
+            val id = if (rawUrl.contains("/details/")) {
+                rawUrl.substringAfter("/details/").substringBefore("?").substringBefore("/")
+            } else {
+                rawUrl.substringAfter("/embed/").substringBefore("?").substringBefore("/")
+            }
+            try {
+                val metadataUrl = "https://archive.org/metadata/$id"
+                val request = okhttp3.Request.Builder().url(metadataUrl).build()
+                HttpClientProvider.activeClearnetClient.newCall(request).execute().use { response ->
+                if (response.isSuccessful) {
+                    val body = response.body?.string()
+                    if (body != null) {
+                        val root = com.noslop.app.util.Json.gson.fromJson(body, com.google.gson.JsonObject::class.java)
+                        val server = root?.get("server")?.asString ?: "archive.org"
+                        val dir = root?.get("dir")?.asString ?: ""
+                        val files = root?.getAsJsonArray("files")
+                        
+                        var bestMp4: String? = null
+                        if (files != null) {
+                            for (el in files) {
+                                val obj = el.asJsonObject
+                                val name = obj.get("name")?.asString ?: continue
+                                val format = obj.get("format")?.asString ?: ""
+                                if (name.endsWith(".mp4", ignoreCase = true) || format.contains("MPEG4") || format.contains("h.264")) {
+                                    val encodedName = android.net.Uri.encode(name)
+                                    bestMp4 = "https://$server$dir/$encodedName"
+                                    break
+                                }
+                            }
+                        }
+                        if (bestMp4 != null) {
+                            Logger.info("VIDEO_RESOLVE", "Resolved archive.org to direct stream: $bestMp4")
+                            return@withContext VideoSource.Direct(bestMp4)
+                        }
+                    }
+                }
+                } // end use
+            } catch (e: Exception) {
+                Logger.warn("VIDEO_RESOLVE", "Archive.org metadata resolution failed: ${e.message}")
+            }
+            VideoSource.Embed("https://archive.org/embed/$id")
+        }
+        else -> VideoSource.Unavailable
+    }
+
+    if (result is VideoSource.Embed) {
+        if (HttpClientProvider.useTorForClearnet) {
+            Logger.warn("VIDEO_RESOLVE", "Clearnet over Tor is ENABLED. WebView embeds bypass Tor and are strictly blocked: $rawUrl")
+            return@withContext VideoSource.Unavailable
+        }
+        if (!com.noslop.app.NoSlopApp.repository.mediaSettingsFlow.value.enableWebViewEmbeds) {
+            Logger.info("VIDEO_RESOLVE", "WebView Embeds disabled by user setting, marking $rawUrl as Unavailable")
+            return@withContext VideoSource.Unavailable
+        }
+    }
+    
+    return@withContext result
+}
+
+private fun isImageUrl(url: String): Boolean {
+    val lower = url.lowercase().substringBefore("?")
+    return lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") ||
+           lower.endsWith(".gif") || lower.endsWith(".webp") || lower.endsWith(".bmp")
+}
+
+private fun isDirectFileUrl(url: String): Boolean {
+    if (url.startsWith("file://")) return true
+    if (url.contains("127.0.0.1") || url.contains("localhost")) return true
+    val lower = url.lowercase().substringBefore("?")
+    return lower.endsWith(".mp4") || lower.endsWith(".mkv") || lower.endsWith(".webm") ||
+           lower.endsWith(".m3u8") || lower.endsWith(".mpd") || lower.endsWith(".ts") ||
+           lower.endsWith(".mp3") || lower.endsWith(".m4a") || lower.endsWith(".ogg") ||
+           lower.contains("/download/") || lower.contains("archive.org/download/")
+}
+
+private fun isYouTubeUrl(url: String): Boolean =
+    (url.contains("youtube.com") || url.contains("youtu.be") || url.contains("youtube-nocookie.com")) &&
+        YouTubeInternalClient.extractVideoId(url) != null
+
+private fun isVimeoUrl(url: String): Boolean =
+    url.contains("vimeo.com")
+
+private fun extractVimeoId(url: String): String? = when {
+    url.contains("/video/") -> url.substringAfter("/video/").substringBefore("?").substringBefore("/").takeIf { it.isNotBlank() }
+    else -> url.substringAfterLast("/").substringBefore("?").takeIf { it.isNotBlank() && it.all { c -> c.isDigit() } }
+}
+
+// Circuit breaker: If YouTube direct stream resolution fails repeatedly,
+// skip the expensive 8-request resolve cycle and go straight to embed.
+private var ytDirectFailCount = 0
+private var ytDirectFailTimestamp = 0L
+private const val YT_CIRCUIT_BREAKER_THRESHOLD = 5
+private const val YT_CIRCUIT_BREAKER_RESET_MS = 45 * 1000L // 45 seconds
+
+private suspend fun resolveYouTubeSource(url: String, quality: String, isPreload: Boolean = false): VideoSource {
+    val videoId = YouTubeInternalClient.extractVideoId(url) ?: run {
+        Logger.warn("VIDEO_RESOLVE", "Could not extract YouTube video ID from: $url")
+        return VideoSource.Unavailable
+    }
+
+    val isTor = HttpClientProvider.useTorForClearnet
+    val now = System.currentTimeMillis()
+
+    // Circuit breaker only applies when Tor is OFF (where WebView embed fallback is permitted).
+    // When routing over Tor, embeds are prohibited for privacy, so the circuit breaker must never
+    // lock out subsequent videos from attempting direct resolution.
+    val circuitBreakerOpen = !isTor && ytDirectFailCount >= YT_CIRCUIT_BREAKER_THRESHOLD && (now - ytDirectFailTimestamp) < YT_CIRCUIT_BREAKER_RESET_MS
+
+    if (circuitBreakerOpen) {
+        Logger.info("VIDEO_RESOLVE", "YouTube direct stream circuit breaker OPEN — skipping to embed for ${Logger.redact(videoId)}")
+    } else {
+        if ((now - ytDirectFailTimestamp) >= YT_CIRCUIT_BREAKER_RESET_MS) {
+            ytDirectFailCount = 0
+        }
+        val streamUrl = YouTubeInternalClient.resolveStreamUrl(videoId, quality, canRotateCircuit = !isPreload)
+        if (streamUrl != null) {
+            ytDirectFailCount = 0
+            return VideoSource.Direct(streamUrl)
+        }
+        if (HttpClientProvider.isNetworkReady && !isTor) {
+            ytDirectFailCount++
+            ytDirectFailTimestamp = System.currentTimeMillis()
+        }
+    }
+
+    if (isTor) {
+        return VideoSource.Unavailable
+    }
+
+    val embedUrl = "https://www.youtube-nocookie.com/embed/$videoId?autoplay=1&playsinline=1&rel=0&modestbranding=1"
+    return VideoSource.Embed(embedUrl)
+}
+
+private fun resolveVimeoSource(url: String, quality: String): VideoSource {
+    val videoId = extractVimeoId(url) ?: run {
+        return fallbackVimeoEmbed(url)
+    }
+
+    return try {
+        val configUrl = "https://player.vimeo.com/video/$videoId/config"
+        val request = okhttp3.Request.Builder()
+            .url(configUrl)
+            .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36")
+            .header("Referer", "https://vimeo.com/")
+            .build()
+
+        val response = HttpClientProvider.activeClearnetClient.newCall(request).execute()
+        val body = response.use { res ->
+            if (!res.isSuccessful) return fallbackVimeoEmbed(url)
+            res.body?.string()
+        } ?: return fallbackVimeoEmbed(url)
+        val root = com.noslop.app.util.Json.gson.fromJson(body, com.google.gson.JsonObject::class.java)
+
+        val progressive = root
+            ?.getAsJsonObject("request")
+            ?.getAsJsonObject("files")
+            ?.getAsJsonArray("progressive")
+
+        if (progressive != null && progressive.size() > 0) {
+            val sortedFormats = progressive.map { it.asJsonObject }.sortedBy { it.get("quality")?.asString?.removeSuffix("p")?.toIntOrNull() ?: 0 }
+            val chosenFormat = when (quality) {
+                "low" -> sortedFormats.first()
+                "medium" -> sortedFormats[sortedFormats.size / 2]
+                else -> sortedFormats.last()
+            }
+            val bestUrl = chosenFormat.get("url")?.asString
+            if (bestUrl != null) return VideoSource.Direct(bestUrl)
+        }
+        fallbackVimeoEmbed(url)
+    } catch (e: Exception) {
+        fallbackVimeoEmbed(url)
+    }
+}
+
+private fun fallbackVimeoEmbed(url: String): VideoSource {
+    val videoId = extractVimeoId(url) ?: return VideoSource.Unavailable
+    return VideoSource.Embed("https://player.vimeo.com/video/$videoId?autoplay=1&background=0")
+}
+
+// --- NOSLOP_PLAYBACK_DIAG_V1 ---------------------------------------------
+// Diagnostics for "it buffers but never plays". The distinguishing question is
+// whether bytes are arriving at all, arriving too slowly, or arriving fine but
+// failing to decode — and none of those were observable from the old logs.
+
+private const val PLAYBACK_DIAG_TAG = "PLAYBACK_DIAG"
+
+private fun playbackStateName(state: Int): String = when (state) {
+    androidx.media3.common.Player.STATE_IDLE -> "IDLE"
+    androidx.media3.common.Player.STATE_BUFFERING -> "BUFFERING"
+    androidx.media3.common.Player.STATE_READY -> "READY"
+    androidx.media3.common.Player.STATE_ENDED -> "ENDED"
+    else -> "UNKNOWN($state)"
+}
+
+private fun errorCodeName(error: androidx.media3.common.PlaybackException): String =
+    try { error.errorCodeName } catch (_: Throwable) { "CODE_" + error.errorCode }
+
+/** Full cause chain, so a wrapped IOException is not invisible. */
+private fun causeChain(t: Throwable?): String {
+    val parts = mutableListOf<String>()
+    var cur = t
+    var depth = 0
+    while (cur != null && depth < 6) {
+        parts.add("${cur.javaClass.simpleName}: ${cur.message}")
+        cur = cur.cause
+        depth++
+    }
+    return parts.joinToString(" <- ").ifBlank { "none" }
+}
+
+/** itag / clen / remaining lifetime, pulled out of a googlevideo URL. */
+internal fun describeStreamUrl(url: String): String {
+    fun param(name: String): String? =
+        Regex("[?&]$name=([^&]+)").find(url)?.groupValues?.get(1)
+    val itag = param("itag") ?: "?"
+    val clen = param("clen")?.toLongOrNull()
+    val expire = param("expire")?.toLongOrNull()
+    val sizeText = clen?.let { "${it / 1_000_000}MB" } ?: "size?"
+    val ttlText = expire?.let {
+        val secs = it - System.currentTimeMillis() / 1000
+        "ttl=${secs / 60}m"
+    } ?: "ttl?"
+    val host = try { java.net.URI(url).host ?: "?" } catch (_: Exception) { "?" }
+    // --- NOSLOP_GEO_LOCK_V1 ---
+    // `ip` is the address the URL was signed for and `gcr` the country it is
+    // pinned to. When the player request went out through the API proxy but
+    // the bytes come back over Tor, these describe a different machine than
+    // the one fetching — which is what a 403 on a freshly-resolved URL
+    // actually means. Without them in the log a geo-lock 403 and an expired
+    // URL look identical.
+    val signedFor = param("ip") ?: "?"
+    val geoLock = param("gcr")?.let { " geoLock=$it" } ?: ""
+    return "itag=$itag $sizeText $ttlText host=$host signedFor=$signedFor$geoLock"
+}
+
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+private fun logPlaybackState(
+    player: androidx.media3.exoplayer.ExoPlayer,
+    state: Int,
+    rawUrl: String,
+    sinceMs: Long
+) {
+    try {
+        Logger.info(
+            PLAYBACK_DIAG_TAG,
+            "state=${playbackStateName(state)} +${System.currentTimeMillis() - sinceMs}ms " +
+                "pos=${player.currentPosition} bufPos=${player.bufferedPosition} " +
+                "bufMs=${player.totalBufferedDuration} pct=${player.bufferedPercentage} " +
+                "playWhenReady=${player.playWhenReady} dur=${player.duration} | $rawUrl"
+        )
+    } catch (e: Exception) {
+        Logger.debug(PLAYBACK_DIAG_TAG, "state log failed: ${e.message}")
+    }
+}
+
+// Auto re-resolve attempts before the user is shown a Retry button.
+private const val MAX_AUTO_RESOLVE_RETRIES = 2
+
+/**
+ * True for failures that a fresh URL is likely to fix: expired/blocked HTTP
+ * responses, dropped or timed-out connections, and the malformed-container
+ * case you get when a CDN answers an expired link with an HTML error page.
+ *
+ * The old code only looked for a bare 403 on `error.cause`, which missed 410
+ * Gone, socket resets from a cold mesh circuit, and anything media3 wrapped
+ * one level deeper.
+ */
+private fun isRecoverablePlaybackError(error: androidx.media3.common.PlaybackException): Boolean {
+    when (error.errorCode) {
+        androidx.media3.common.PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
+        androidx.media3.common.PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
+        androidx.media3.common.PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
+        androidx.media3.common.PlaybackException.ERROR_CODE_IO_INVALID_HTTP_CONTENT_TYPE,
+        androidx.media3.common.PlaybackException.ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE,
+        androidx.media3.common.PlaybackException.ERROR_CODE_IO_UNSPECIFIED,
+        // A surface detach or the stuck player detector timed out. The stream may be fine, and a retry
+        // costs less than a dead slide with a Retry button.
+        androidx.media3.common.PlaybackException.ERROR_CODE_TIMEOUT,
+        androidx.media3.common.PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED,
+        androidx.media3.common.PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED -> return true
+    }
+    // Belt and braces: walk the cause chain for an HTTP status we recognise.
+    var cause: Throwable? = error.cause
+    var depth = 0
+    while (cause != null && depth < 5) {
+        if (cause is androidx.media3.datasource.HttpDataSource.InvalidResponseCodeException) {
+            val code = cause.responseCode
+            if (code == 403 || code == 404 || code == 410 || code == 429 || code >= 500) return true
+        }
+        if (cause is java.net.SocketTimeoutException ||
+            cause is java.net.SocketException ||
+            cause is java.io.EOFException
+        ) return true
+        cause = cause.cause
+        depth++
+    }
+    return false
+}
+
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+@Composable
+fun VideoPlayer(
+    url: String,
+    isVisible: Boolean = true,
+    isNextSlide: Boolean = false,
+    thumbnailUrl: String? = null,
+    thumbnailB64: String? = null,
+    stableKey: String? = null,
+    onPlaybackStarted: (() -> Unit)? = null
+) {
+    // --- NOSLOP_HELD_PLAYBACK_URL_V1 ---
+    // A mesh video streaming through the proxy switches from the proxy URL to a file:// URL when its
+    // download finishes. Every remember(url) below would reset and the slide would restart from
+    // "Finding stream" mid-watch. While the item is on screen it keeps the URL it started with; the
+    // retry path finds the local file on its own (doResolve) if the proxy stream ever fails.
+    var heldUrl by remember(stableKey ?: url) { mutableStateOf(url) }
+    SideEffect { if (!isVisible) heldUrl = url }
+    VideoPlayerContent(
+        url = if (isVisible) heldUrl else url,
+        isVisible = isVisible,
+        isNextSlide = isNextSlide,
+        thumbnailUrl = thumbnailUrl,
+        thumbnailB64 = thumbnailB64,
+        stableKey = stableKey,
+        onPlaybackStarted = onPlaybackStarted
+    )
+}
+
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+@Composable
+private fun VideoPlayerContent(
+    url: String,
+    isVisible: Boolean,
+    isNextSlide: Boolean,
+    thumbnailUrl: String?,
+    thumbnailB64: String?,
+    stableKey: String?,
+    onPlaybackStarted: (() -> Unit)?
+) {
+    if (url.isBlank()) return
+    val context = LocalContext.current
+    val configuration = androidx.compose.ui.platform.LocalConfiguration.current
+    val isLandscape = configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+
+    rememberAutoFullscreenOnLandscape(enabled = isVisible)
+
+    // --- NOSLOP_FEED_VARIETY_V1 ---
+    // Keyed on url: unkeyed, a recycled slide inherited the previous item's
+    // retry count, so a fresh video could start with forceRefresh already on
+    // and its auto-retry budget already spent.
+    var retryTrigger by remember(url) { mutableStateOf(0) }
+    val mediaSettings by com.noslop.app.NoSlopApp.repository.mediaSettingsFlow.collectAsState()
+    val isTorRouting by com.noslop.app.NoSlopApp.repository.useTorForClearnet.collectAsState()
+    val initialSource = remember(url, mediaSettings.videoQuality) {
+        val q = mediaSettings.videoQuality.ifBlank { "medium" }
+        val exactKey = "$url||$q"
+        // NOSLOP_ROUTE_AWARE_CACHE_V1 — this fast path read the map directly and
+        // checked only expiry, so it would hand ExoPlayer a URL bound to an exit
+        // we have since rotated away from. That is the stall the 00:25:45
+        // capture shows: bufPos frozen at 11593 with delta=0ms.
+        sourceCache[exactKey]?.takeIf { it.stalenessReason() == null }?.source
+            ?: sourceCache.entries.find { it.key.startsWith("$url||") && it.value.stalenessReason() == null }?.value?.source
+    }
+
+    var source by remember(url) { mutableStateOf<VideoSource?>(initialSource) }
+    var isVideoReady by remember(url) { mutableStateOf(false) }
+
+    // Stable playback recovery callback: only reset retry count if video is actively playing
+    val onStablePlayback = {
+        if (retryTrigger > 0 && isVideoReady) {
+            Logger.info("VIDEO", "Video has played stably for 16s — resetting retry trigger to 0 without recreating player")
+            retryTrigger = 0
+        }
+    }
+
+    // --- NOSLOP_FAILURE_VISIBILITY_V1 ---
+    // Hoisted out of ExoVideoPlayer. The parent owns the poster overlay, so
+    // the parent is the only place that can decide to stop covering the
+    // error screen with it.
+    var directPlaybackFailed by remember(url) { mutableStateOf(false) }
+    
+    // DEBOUNCE VISIBILITY TO PREVENT FLICKERS AND UNWANTED RECOMPOSITIONS!
+    val isActiveOrNext = isVisible || isNextSlide
+    var activeVisible by remember(url) { mutableStateOf(isActiveOrNext) }
+    LaunchedEffect(isActiveOrNext, url) {
+        if (isActiveOrNext) {
+            activeVisible = true
+        } else {
+            kotlinx.coroutines.delay(500)
+            activeVisible = false
+            isVideoReady = false
+        }
+    }
+
+    var lastTorRouting by remember(url) { mutableStateOf(isTorRouting) }
+    // The retryTrigger value this effect last acted on. See NOSLOP_RETRY_ONCE_V1 below.
+    var handledRetry by remember(url) { mutableStateOf(0) }
+    LaunchedEffect(url, retryTrigger, mediaSettings.videoQuality, isVisible, activeVisible, isTorRouting) {
+        // Offscreen next slide is warmed by PreloadManager; VideoPlayer only resolves for the visible slide
+        if (!isVisible && !activeVisible) return@LaunchedEffect
+
+        // R14: Active player teardown on route change (do not early return!)
+        val routeChanged = (isTorRouting != lastTorRouting)
+        if (routeChanged) {
+            lastTorRouting = isTorRouting
+            Logger.info("VIDEO_ROUTE", "Network route changed to isTorRouting=$isTorRouting for $url — tearing down active player")
+            source = null
+            isVideoReady = false
+            directPlaybackFailed = false
+            retryTrigger++
+            return@LaunchedEffect
+        }
+
+        // --- NOSLOP_RETRY_ONCE_V1 ---
+        // A retry is acted on once. This effect also restarts when isVisible or activeVisible change,
+        // and retryTrigger stays above 0 until 16 s of stable playback. Reading "above 0" as "retry now"
+        // meant that coming back to a slide within those 16 s threw away a healthy player and showed
+        // "Finding stream". If nothing new was asked for and the slide is playing, leave it alone.
+        val retryIsNew = retryTrigger > 0 && retryTrigger != handledRetry
+        handledRetry = retryTrigger
+        if (!retryIsNew && isVideoReady && source != null) return@LaunchedEffect
+        val forceRefresh = retryIsNew
+        if (forceRefresh) {
+            Logger.info("VIDEO", "Clearing the source to re-resolve (retry $retryTrigger): $url")
+            source = null
+            isVideoReady = false
+        }
+        // If this slide is merely next but not visible, only check existing cache without triggering network resolves
+        if (!isVisible && activeVisible) {
+            val cached = sourceCache["$url||${mediaSettings.videoQuality.ifBlank { "medium" }}"]?.takeIf { it.stalenessReason() == null }?.source
+            if (cached != null) source = cached
+            return@LaunchedEffect
+        }
+        com.noslop.app.ui.PreloadManager.isVideoActive = true
+        Logger.info("VIDEO", "Resolving source for: $url ${Logger.redact(url)} (retry: $retryTrigger)")
+        val resolvedSource = resolveSource(url, forceRefresh = forceRefresh, context = context)
+        source = resolvedSource
+        Logger.info("VIDEO", "Resolved source for $url → ${resolvedSource.javaClass.simpleName}")
+        // R3: only a mounted ExoVideoPlayer clears isVideoActive (onDispose). Embeds, unavailable sources
+        // and off-screen slides never mount one, which left the flag stuck on and stalled background work.
+        if (resolvedSource !is VideoSource.Direct || !isVisible) {
+            com.noslop.app.ui.PreloadManager.isVideoActive = false
+        }
+
+        // --- NOSLOP_AUTO_RETRY_UNAVAILABLE_V1 ---
+        // retryTrigger only ever advanced on ExoPlayer *playback* errors, so a
+        // slide that failed to RESOLVE just parked on the Retry button and
+        // waited for a tap. In practice that tap usually works, which means
+        // the app was asking the user to do by hand what it should do itself.
+        //
+        // The reason it works is §16.16: the first resolve lost the exit
+        // lottery, and by the time a human reacts the circuit has moved on.
+        // Waiting ~2.5s reproduces that automatically — long enough for a
+        // sibling resolve's rotation to have landed, short enough that the
+        // slide is usually still on screen.
+        //
+        // Only one automatic attempt. If it fails again the exit is not the
+        // problem and the button is the honest answer.
+        if (resolvedSource is VideoSource.Unavailable && retryTrigger == 0 && activeVisible) {
+            kotlinx.coroutines.delay(300L)
+            Logger.info("VIDEO", "Auto-retrying unavailable resolve for $url on a fresher circuit")
+            retryTrigger++
+        }
+    }
+
+    // --- NOSLOP_SMOOTH_TEARDOWN_V1 --- see PlaybackPolicy.kt
+    val keepPlayerMounted = rememberHeldTrue(isVisible, PLAYER_UNMOUNT_DELAY_MS, url)
+
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        when (val resolved = source) {
+            null -> {
+                // Shimmer now handled at the end of the Box stack
+            }
+
+            is VideoSource.Direct -> {
+                // Mount ExoVideoPlayer only for the slide on screen, plus a moment after it leaves so the
+                // teardown misses the swipe animation. PreloadManager handles warming upcoming slides;
+                // mounting ExoVideoPlayer for offscreen slides starves Tor bandwidth and kills active playback.
+                if (keepPlayerMounted) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .zIndex(if (directPlaybackFailed) 3f else 0f)
+                    ) {
+                        // Use playerMountKey so resetting retryTrigger to 0 after stable playback does NOT kill the player
+                        var playerMountKey by remember(url) { mutableStateOf(0) }
+                        ExoVideoPlayer(
+                            url = resolved.url,
+                            rawUrl = stableKey ?: url,
+                            resolveKey = url,
+                            isLandscape = isLandscape,
+                            isVisible = isVisible,
+                            thumbnailUrl = thumbnailUrl,
+                            thumbnailB64 = thumbnailB64,
+                            retryKey = playerMountKey,
+                            canRetry = retryTrigger < MAX_AUTO_RESOLVE_RETRIES || isVideoReady || PlaybackPositionStore.resumePositionFor(stableKey ?: url) >= 8000L,
+                            onRetry = {
+                                directPlaybackFailed = false
+                                isVideoReady = false
+                                source = null // Immediately clear old source so player is not recreated with stale URL
+                                retryTrigger++
+                            },
+                            onReady = {
+                                com.noslop.app.tor.TorService.setTorStatusMessage(null)
+                                isVideoReady = true
+                                directPlaybackFailed = false
+                                onPlaybackStarted?.invoke()
+                            },
+                            onStablePlayback = onStablePlayback,
+                            onFailed = { directPlaybackFailed = true }
+                        )
+                    }
+                }
+            }
+
+            is VideoSource.Embed -> {
+                if (activeVisible) {
+                    EmbedWebViewPlayer(
+                        url = resolved.url,
+                        rawUrl = stableKey ?: url,
+                        isVisible = isVisible,
+                        onRetry = { retryTrigger++ },
+                        onReady = { isVideoReady = true }
+                    )
+                }
+            }
+
+            is VideoSource.Unavailable -> {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    // --- NOSLOP_FAILURE_VISIBILITY_V1 ---
+                    // Poster sits at zIndex(1f) and the loading overlay at
+                    // zIndex(2f); without this the whole error card was
+                    // rendered underneath both and never seen.
+                    modifier = Modifier
+                        .zIndex(3f)
+                        .background(PrimaryBlack.copy(alpha = 0.7f))
+                        .padding(16.dp)
+                ) {
+                    Icon(
+                        Icons.Default.Warning,
+                        contentDescription = null,
+                        tint = AccentGreen,
+                        modifier = Modifier.size(48.dp)
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text("Video unavailable".tr, color = TextLight, fontWeight = FontWeight.Bold)
+                    Text(
+                        "Could not resolve a playable stream.".tr,
+                        color = TextMuted,
+                        style = MaterialTheme.typography.bodySmall,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 32.dp)
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Button(
+                        onClick = { retryTrigger++ },
+                        colors = ButtonDefaults.buttonColors(containerColor = AccentGreen)
+                    ) {
+                        Text("Retry".tr, color = PrimaryBlack, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+
+        // --- NOSLOP_FAILURE_VISIBILITY_V1 ---
+        // `source is Unavailable` used to force the poster on, which drew it
+        // on top of the error card the branch above had just composed. A
+        // failed slide now keeps the poster only as a dimmed backdrop, with
+        // the error and its Retry button on top where they belong.
+        val hasFailed = source is VideoSource.Unavailable || directPlaybackFailed
+        val showThumbnail = source == null || !activeVisible || !isVideoReady || hasFailed
+        
+        val decodedB64 = remember(thumbnailB64) {
+            thumbnailB64?.let {
+                try {
+                    val bytes = android.util.Base64.decode(it, android.util.Base64.DEFAULT)
+                    android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                } catch (e: Exception) { null }
+            }
+        }
+        
+        if (showThumbnail && (thumbnailUrl != null || decodedB64 != null)) {
+            Box(modifier = Modifier.fillMaxSize().zIndex(1f).clipToBounds()) {
+                // Blurred background layer to prevent black bars
+                AsyncImage(
+                    model = thumbnailUrl ?: decodedB64,
+                    contentDescription = null,
+                    modifier = Modifier.fillMaxSize().scale(1.35f).blur(24.dp),
+                    contentScale = ContentScale.Crop,
+                    colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(
+                        PrimaryBlack.copy(alpha = 0.5f),
+                        androidx.compose.ui.graphics.BlendMode.Darken
+                    )
+                )
+                // Proper, uncropped thumbnail in front with crossfade
+                val thumbModel = remember(thumbnailUrl, decodedB64) {
+                    coil.request.ImageRequest.Builder(context)
+                        .data(thumbnailUrl ?: decodedB64)
+                        .crossfade(true)
+                        .build()
+                }
+                AsyncImage(
+                    model = thumbModel,
+                    contentDescription = "Video Thumbnail".tr,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Fit
+                )
+                // --- NOSLOP_FAILURE_VISIBILITY_V1 ---
+                // Scrim so the error card above reads clearly against a busy
+                // poster instead of fighting it for contrast.
+                if (hasFailed) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(PrimaryBlack.copy(alpha = 0.6f))
+                    )
+                }
+            }
+        } else if (source == null && thumbnailUrl == null && thumbnailB64 == null && !isVideoReady) {
+            Box(modifier = Modifier.fillMaxSize().zIndex(1f)) {
+                com.noslop.app.ui.LoadingShimmer()
+            }
+        }
+
+        // --- NOSLOP_LOADING_OVERLAY_V1 ---
+        // Spinner on top of the poster while we resolve a stream and buffer the
+        // first frame. Feed slides are usually pre-warmed so this flashes by;
+        // search results are not, and resolveSource() can take several seconds
+        // walking the InnerTube clients, which previously looked like a freeze.
+        val isResolving = source == null
+        val awaitingFirstFrame = source is VideoSource.Direct || source is VideoSource.Embed
+
+        // Never spin forever: if nothing has become ready by now, something is
+        // wrong and the error / thumbnail state is the more honest thing to show.
+        var loadingTimedOut by remember(url, retryTrigger) { mutableStateOf(false) }
+        LaunchedEffect(url, retryTrigger, isVideoReady, isVisible) {
+            if (isVideoReady || !isVisible) {
+                loadingTimedOut = false
+            } else {
+                kotlinx.coroutines.delay(45_000L)
+                loadingTimedOut = true
+            }
+        }
+
+        // Show loading overlay immediately on frame 1 when isVisible is true or activeVisible is warming up
+        val shouldShowLoading = (isVisible || activeVisible) && !isVideoReady && !loadingTimedOut && !hasFailed &&
+            (isResolving || awaitingFirstFrame)
+
+        if (shouldShowLoading) {
+            VideoLoadingOverlay(
+                label = if (isResolving) "Finding stream".tr else "Buffering".tr,
+                modifier = Modifier.zIndex(2f)
+            )
+        }
+    }
+}
+
+// --- NOSLOP_LOADING_OVERLAY_V1 ---------------------------------------------
+/**
+ * Translucent loading indicator drawn OVER whatever is already on screen
+ * (usually the poster thumbnail).
+ *
+ * Deliberately not [com.noslop.app.ui.LoadingShimmer]: that one paints an
+ * opaque PrimaryBlack background, which is why it could only ever be shown
+ * when there was no thumbnail to hide.
+ */
+@Composable
+private fun VideoLoadingOverlay(
+    label: String,
+    modifier: Modifier = Modifier
+) {
+    val infiniteTransition = androidx.compose.animation.core.rememberInfiniteTransition(
+        label = "video_loading"
+    )
+    val pulse by infiniteTransition.animateFloat(
+        initialValue = 0.45f,
+        targetValue = 1f,
+        animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+            animation = androidx.compose.animation.core.tween(
+                900,
+                easing = androidx.compose.animation.core.FastOutSlowInEasing
+            ),
+            repeatMode = androidx.compose.animation.core.RepeatMode.Reverse
+        ),
+        label = "video_loading_pulse"
+    )
+
+    Box(
+        modifier = modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier
+                .background(
+                    PrimaryBlack.copy(alpha = 0.55f),
+                    shape = androidx.compose.foundation.shape.RoundedCornerShape(16.dp)
+                )
+                .padding(horizontal = 24.dp, vertical = 20.dp)
+        ) {
+            CircularProgressIndicator(
+                color = AccentGreen,
+                modifier = Modifier.size(40.dp),
+                strokeWidth = 3.dp
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                text = label,
+                color = TextLight.copy(alpha = pulse),
+                style = MaterialTheme.typography.bodySmall.copy(
+                    fontWeight = FontWeight.Bold
+                )
+            )
+        }
+    }
+}
+
+/** The HTTP client a stream must be fetched with. A googlevideo URL only works from the exit that resolved it. */
+internal fun mediaClientFor(streamUrl: String, rawUrl: String): okhttp3.OkHttpClient {
+    val streamId = YouTubeInternalClient.getStreamIdForUrl(streamUrl)
+        ?: YouTubeInternalClient.getStreamIdForUrl(rawUrl)
+        ?: ("stream_" + (rawUrl.hashCode() and 0x7fffffff))
+    val isYouTube = streamUrl.contains("googlevideo") || rawUrl.contains("youtube") || streamId.startsWith("yt_")
+    return when {
+        isYouTube -> HttpClientProvider.getOrCreateIsolatedMediaClient(streamId)
+        streamUrl.contains("127.0.0.1") || streamUrl.contains("localhost") -> HttpClientProvider.loopbackClient
+        else -> HttpClientProvider.activeClearnetClient
+    }
+}
+
+// --- NOSLOP_AWAY_RECOVERY_V1 ---
+// Keeps a player alive through a stall or error while the app is in the background. The normal retry
+// path clears `source`, which releases the player: audio stops, and a user coming back during the
+// resolve (seconds to a minute over Tor) meets "Finding stream" on a video that was playing. Here the
+// player is kept and a fresh stream is swapped into it at the same position.
+private class AwayRecoveryState {
+    var job: kotlinx.coroutines.Job? = null
+    var attempts = 0
+    var retryOnReturn = false
+    var wasAway = false
+    // --- NOSLOP_ONSCREEN_RECOVERY_V1 ---
+    var hasPlayed = false
+    val rebuffering = RebufferWindow()
+}
+
+/**
+ * A source for [streamUrl] on the client that URL needs. A running player keeps the client it was
+ * built with, so after a circuit change setMediaItem() would fetch from the wrong exit: it has to be
+ * given a source that carries its own client.
+ */
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+private fun buildRecoverySource(
+    context: android.content.Context,
+    streamUrl: String,
+    rawUrl: String
+): androidx.media3.exoplayer.source.MediaSource {
+    val listener = PreloadManager.globalTransferListener
+    val httpFactory = OkHttpDataSource.Factory(mediaClientFor(streamUrl, rawUrl)).setTransferListener(listener)
+    // NOSLOP_CHUNKED_STREAM_V1 — googlevideo in 8 MiB pieces (ChunkedRangeDataSource)
+    val dataSourceFactory = androidx.media3.datasource.DefaultDataSource.Factory(context, ChunkedRangeDataSource.Factory(httpFactory))
+        .setTransferListener(listener)
+    val mimeType = when {
+        streamUrl.contains(".m3u8", ignoreCase = true) || streamUrl.contains("hls", ignoreCase = true) -> androidx.media3.common.MimeTypes.APPLICATION_M3U8
+        streamUrl.contains(".mpd", ignoreCase = true) -> androidx.media3.common.MimeTypes.APPLICATION_MPD
+        else -> androidx.media3.common.MimeTypes.VIDEO_MP4
+    }
+    val mediaItem = androidx.media3.common.MediaItem.Builder().setUri(streamUrl).setMimeType(mimeType).build()
+    return DefaultMediaSourceFactory(dataSourceFactory).createMediaSource(mediaItem)
+}
+
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+@Composable
+private fun ExoVideoPlayer(
+    url: String,
+    rawUrl: String,
+    resolveKey: String = rawUrl,
+    isLandscape: Boolean,
+    isVisible: Boolean,
+    thumbnailUrl: String? = null,
+    thumbnailB64: String? = null,
+    retryKey: Int = 0,
+    canRetry: Boolean = true,
+    onRetry: () -> Unit,
+    onReady: () -> Unit,
+    onStablePlayback: () -> Unit = {},
+    // --- NOSLOP_FAILURE_VISIBILITY_V1 ---
+    // Raised when the player gives up for good, so the parent can uncover
+    // the error card it draws underneath the poster.
+    onFailed: () -> Unit = {}
+) {
+    val context = LocalContext.current
+    var exoPlayer by remember { mutableStateOf<androidx.media3.exoplayer.ExoPlayer?>(null) }
+    var hasError by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf("") }
+    var isBuffering by remember { mutableStateOf(true) }
+
+    // The player's listeners and the stall sampler outlive the composition that created them, so they
+    // need the current values, not the ones from when they were set up.
+    val currentIsVisible by rememberUpdatedState(isVisible)
+    val currentCanRetry by rememberUpdatedState(canRetry)
+    // A pause the user asked for. onRenderedFirstFrame fires again whenever a surface comes back, and
+    // used to restart a video the user had paused before leaving the app.
+    var userPaused by remember(url, retryKey) { mutableStateOf(false) }
+    // --- NOSLOP_WARM_START_SYNC_V1 ---
+    // True from the claim of a warm player until its first frame is on this slide. See holdsAudioForFirstFrame.
+    var warmStartHeld by remember(url, retryKey) { mutableStateOf(false) }
+
+    // --- NOSLOP_AWAY_RECOVERY_V1 ---
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    val recoveryScope = rememberCoroutineScope()
+    val awayRecovery = remember(url, retryKey) { AwayRecoveryState() }
+    fun appStateLabel(): String = lifecycleOwner.lifecycle.currentState.name
+
+    /**
+     * True if this call took charge of the failure: a recovery is running or has started, keeping the
+     * player. False means the caller should use the normal retry path. [streamCanRecover] is false for
+     * a failure a new stream would not fix, which on screen belongs on the normal error path.
+     */
+    fun recoverInPlace(
+        player: androidx.media3.exoplayer.ExoPlayer,
+        reason: String,
+        freshCircuit: Boolean,
+        streamCanRecover: Boolean = true
+    ): Boolean {
+        val appStarted = lifecycleOwner.lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)
+        if (appStarted && !streamCanRecover) return false
+        val decision = decideRecovery(
+            appStarted = appStarted,
+            hasPlayed = awayRecovery.hasPlayed,
+            recoveryRunning = awayRecovery.job?.isActive == true,
+            attemptsUsed = awayRecovery.attempts
+        )
+        when (decision) {
+            RecoveryDecision.NORMAL_RETRY -> return false
+            RecoveryDecision.ALREADY_RUNNING -> return true
+            RecoveryDecision.GIVE_UP -> {
+                Logger.warn("VIDEO_AWAY", "Giving up after ${awayRecovery.attempts} attempts ($reason); will retry on return: $rawUrl")
+                awayRecovery.retryOnReturn = true
+                return true
+            }
+            RecoveryDecision.START -> Unit
+        }
+        Logger.info("VIDEO_AWAY", "Recovering in place (app=${appStateLabel()}, $reason) at pos=${player.currentPosition}ms: $rawUrl")
+        // --- NOSLOP_ONSCREEN_RECOVERY_V1 ---
+        // A player stopped by an error reports no buffering, which would leave a frozen frame with no
+        // sign of life for as long as the resolve takes.
+        if (player.playbackState != androidx.media3.common.Player.STATE_READY) isBuffering = true
+        awayRecovery.job = recoveryScope.launch {
+            if (freshCircuit) {
+                YouTubeInternalClient.extractVideoId(rawUrl)?.let { YouTubeInternalClient.advanceStreamNonce(it) }
+            }
+            while (true) {
+                awayRecovery.attempts++
+                PreloadManager.invalidate(rawUrl)
+                sourceCache.keys.removeAll { it.startsWith("$rawUrl||") }
+                val fresh = resolveSource(resolveKey, forceRefresh = true, context = context)
+                if (fresh is VideoSource.Direct) {
+                    // --- NOSLOP_ONSCREEN_RECOVERY_V1 ---
+                    // The old stream kept playing while this resolved, so look at it again: swapping
+                    // throws away its buffer, and it may have recovered or the user may have moved on.
+                    val onScreen = lifecycleOwner.lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)
+                    if (onScreen && (!currentIsVisible || keepsCurrentStream(player.isPlaying, player.totalBufferedDuration))) {
+                        Logger.info("VIDEO_AWAY", "No swap needed (visible=$currentIsVisible, bufMs=${player.totalBufferedDuration}): $rawUrl")
+                        return@launch
+                    }
+                    val resumeAtMs = player.currentPosition
+                    player.setMediaSource(buildRecoverySource(context, fresh.url, rawUrl), resumeAtMs)
+                    player.prepare()
+                    Logger.info("VIDEO_AWAY", "Swapped in a fresh stream at pos=${resumeAtMs}ms (attempt ${awayRecovery.attempts}): $rawUrl")
+                    return@launch
+                }
+                if (awayRecovery.attempts >= MAX_IN_PLACE_RECOVERIES) {
+                    if (lifecycleOwner.lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) {
+                        Logger.warn("VIDEO_AWAY", "No stream after ${awayRecovery.attempts} attempts; using the normal retry: $rawUrl")
+                        onRetry()
+                    } else {
+                        Logger.warn("VIDEO_AWAY", "No stream after ${awayRecovery.attempts} attempts; will retry on return: $rawUrl")
+                        awayRecovery.retryOnReturn = true
+                    }
+                    return@launch
+                }
+                kotlinx.coroutines.delay(AWAY_RECOVERY_RETRY_DELAY_MS)
+            }
+        }
+        return true
+    }
+
+    // --- NOSLOP_FAILURE_VISIBILITY_V1 ---
+    // One place to notify the parent, rather than duplicating the call at
+    // each of the three `hasError = true` sites below.
+    LaunchedEffect(hasError) {
+        if (!hasError) return@LaunchedEffect
+        // --- NOSLOP_RESUME_POISON_V1 ---
+        // No duration means the media never prepared, so any stored offset for
+        // this item is a seek target that was never reached. Seeking back to it
+        // on the next visit just reproduces the same failure, which is how a
+        // single bad load turned into a permanently broken slide.
+        val preparedDurationMs = try { exoPlayer?.duration ?: 0L } catch (_: Exception) { 0L }
+        if (preparedDurationMs <= 0L) {
+            Logger.info(
+                "VIDEO",
+                "Clearing stale resume position for $rawUrl — media never prepared, so the " +
+                    "stored offset was never actually played"
+            )
+            PlaybackPositionStore.clear(rawUrl)
+        }
+        onFailed()
+    }
+
+    LaunchedEffect(isVisible, exoPlayer) {
+        exoPlayer?.let { player ->
+            if (isVisible) {
+                com.noslop.app.tor.TorService.noteMediaProgress()
+                // --- NOSLOP_SMOOTH_TEARDOWN_V1 ---
+                // Swiped back while the player was still held: it is the active stream again, and may
+                // have been stopped already.
+                PreloadManager.currentlyPlayingUrl = rawUrl
+                if (player.playbackState == androidx.media3.common.Player.STATE_IDLE && player.playerError == null) {
+                    player.prepare()
+                }
+                if (player.playbackState == androidx.media3.common.Player.STATE_READY) {
+                    onReady()
+                }
+            }
+            player.playWhenReady = isVisible && !userPaused && !warmStartHeld
+            if (!isVisible) {
+                player.pause()
+                try {
+                    val currentPos = player.currentPosition
+                    Logger.debug("VIDEO_DEBUG", "LaunchedEffect isVisible=false. currentPos=$currentPos, duration=${player.duration}, rawUrl=$rawUrl")
+                    // Only store resume positions if user watched at least 8 seconds; swiping past should not poison the buffer
+                    if (currentPos >= 8000L) {
+                        PlaybackPositionStore.save(rawUrl, currentPos, player.duration)
+                    }
+                } catch (e: Exception) {
+                    Logger.debug("VIDEO_DEBUG", "Failed to save playback position on pause: ${e.message}")
+                }
+                // --- NOSLOP_SMOOTH_TEARDOWN_V1 ---
+                // Frees the decoder on the playback thread. Cancelled if the slide comes back in time.
+                // NOSLOP_KEEP_SWIPED_V1 — a player that will be kept is only paused: stopping it threw
+                // its buffer away, and a swipe back had to download it again.
+                if (!PreloadManager.canKeep(rawUrl, url, player)) {
+                    kotlinx.coroutines.delay(PLAYER_STOP_DELAY_MS)
+                    player.stop()
+                }
+            }
+        }
+    }
+
+    // --- NOSLOP_WARM_START_SYNC_V1 ---
+    // The first frame ends the hold. This is for a slide where it doesn't come, which must not stay silent.
+    LaunchedEffect(exoPlayer, warmStartHeld) {
+        val player = exoPlayer
+        if (player == null || !warmStartHeld) return@LaunchedEffect
+        kotlinx.coroutines.delay(WARM_FIRST_FRAME_WAIT_MS)
+        Logger.warn(AV_SYNC_TAG, "No first frame ${WARM_FIRST_FRAME_WAIT_MS}ms after the claim, starting anyway | ${Logger.redact(rawUrl)}")
+        warmStartHeld = false
+        player.playWhenReady = currentIsVisible && !userPaused
+    }
+
+    // --- NOSLOP_AV_SYNC_DIAG_V1 ---
+    LaunchedEffect(exoPlayer, isVisible) {
+        val player = exoPlayer
+        if (player != null && isVisible) AvSyncDiagnostics.of(player)?.sampleWhilePlaying(player)
+    }
+
+    // --- NOSLOP_AWAY_RECOVERY_V1 ---
+    DisposableEffect(lifecycleOwner, url, retryKey) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_STOP -> {
+                    awayRecovery.wasAway = true
+                    Logger.info("VIDEO_AWAY", "App left: state=${exoPlayer?.playbackState} playing=${exoPlayer?.isPlaying} wants=${exoPlayer?.playWhenReady} suppressed=${exoPlayer?.playbackSuppressionReason} userPaused=$userPaused pos=${exoPlayer?.currentPosition} | $rawUrl")
+                }
+                androidx.lifecycle.Lifecycle.Event.ON_START -> {
+                    if (awayRecovery.wasAway) {
+                        awayRecovery.wasAway = false
+                        Logger.info("VIDEO_AWAY", "App returned: state=${exoPlayer?.playbackState} playing=${exoPlayer?.isPlaying} wants=${exoPlayer?.playWhenReady} suppressed=${exoPlayer?.playbackSuppressionReason} userPaused=$userPaused pos=${exoPlayer?.currentPosition} | $rawUrl")
+                        if (awayRecovery.retryOnReturn) {
+                            awayRecovery.retryOnReturn = false
+                            if (exoPlayer?.isPlaying != true && awayRecovery.job?.isActive != true) onRetry()
+                        }
+                    }
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    var videoSizeState by remember { mutableStateOf(androidx.media3.common.VideoSize.UNKNOWN) }
+
+    // --- NOSLOP_PLAYBACK_DIAG_V1 ---
+    // Sample the buffer while stuck. A zero delta means no bytes are arriving
+    // (dead URL / blocked host / Tor stall); a small non-zero delta means
+    // bandwidth starvation; a full buffer with no READY means the container or
+    // codec is the problem. These look identical in the old logs.
+    val diagStartMs = remember(url, retryKey) { System.currentTimeMillis() }
+    var lastNetworkByteTimeMs by remember(url, retryKey) { mutableStateOf(System.currentTimeMillis()) }
+    var networkBytesReceivedInSession by remember(url, retryKey) { mutableStateOf(0L) }
+    LaunchedEffect(url, retryKey, isVisible) {
+        if (!isVisible) return@LaunchedEffect
+        var lastBufPos = -1L
+        var lastBytesCount = 0L
+        var stalledSamples = 0
+        var continuousBufferingSamples = 0
+        var stablePlaySamples = 0
+        var baselineBufPos = -1L
+        while (true) {
+            kotlinx.coroutines.delay(2000L)
+            val p = exoPlayer ?: continue
+            try {
+                // A running recovery owns the player until it finishes.
+                if (awayRecovery.job?.isActive == true) {
+                    stalledSamples = 0
+                    continuousBufferingSamples = 0
+                    stablePlaySamples = 0
+                    lastBufPos = -1L
+                    awayRecovery.rebuffering.reset()
+                    continue
+                }
+                // Do not count stalled samples if player is paused by user or in IDLE state
+                if (!p.playWhenReady || p.playbackState == androidx.media3.common.Player.STATE_IDLE) {
+                    stalledSamples = 0
+                    continuousBufferingSamples = 0
+                    stablePlaySamples = 0
+                    lastBufPos = -1L
+                    awayRecovery.rebuffering.reset()
+                    continue
+                }
+                if (p.playbackState == androidx.media3.common.Player.STATE_READY && p.isPlaying) {
+                    stalledSamples = 0
+                    continuousBufferingSamples = 0
+                    baselineBufPos = -1L
+                    lastBufPos = p.bufferedPosition
+                    awayRecovery.hasPlayed = true
+                    awayRecovery.rebuffering.record(buffering = false)
+                    stablePlaySamples++
+                    if (stablePlaySamples >= 8) { // 16s of continuous stable playback
+                        onStablePlayback()
+                        awayRecovery.attempts = 0
+                    }
+                    continue
+                } else {
+                    stablePlaySamples = 0
+                }
+
+                // Suppressed by a transient audio focus loss: not a stall, and retrying would destroy
+                // a healthy player. See canCountAsStall.
+                if (!canCountAsStall(p.playbackState, p.playWhenReady, p.isPlaying)) {
+                    stalledSamples = 0
+                    continuousBufferingSamples = 0
+                    lastBufPos = -1L
+                    awayRecovery.rebuffering.reset()
+                    continue
+                }
+
+                val isBuffering = p.playbackState == androidx.media3.common.Player.STATE_BUFFERING
+                awayRecovery.rebuffering.record(buffering = isBuffering)
+                if (isBuffering) {
+                    continuousBufferingSamples++
+                } else {
+                    continuousBufferingSamples = 0
+                }
+
+                val bufPos = p.bufferedPosition
+                if (baselineBufPos < 0L) baselineBufPos = bufPos
+                val delta = if (lastBufPos < 0) 0L else bufPos - lastBufPos
+                val totalBytes = networkBytesReceivedInSession + com.noslop.app.ui.PreloadManager.networkBytesReceivedInSession
+                val bytesDelta = totalBytes - lastBytesCount
+                lastBytesCount = totalBytes
+                val now = System.currentTimeMillis()
+                val latestByteTime = maxOf(lastNetworkByteTimeMs, com.noslop.app.ui.PreloadManager.lastNetworkByteTimeMs)
+                val hasRecentNetworkBytes = (now - latestByteTime) < 14_000L || bytesDelta > 0L
+
+                if (delta > 0L || hasRecentNetworkBytes) com.noslop.app.tor.TorService.noteMediaProgress()
+                // True advancement: either decoded timeline advance OR active byte transfer over Tor socket
+                // During active BUFFERING, require meaningful buffer advancement (not just tiny trickle bytes)
+                val isAdvancing = if (isBuffering) (delta >= 1000L || bytesDelta > 32 * 1024L) else (delta > 0L || hasRecentNetworkBytes)
+                stalledSamples = if (isAdvancing) 0 else (stalledSamples + 1)
+                Logger.info(
+                    PLAYBACK_DIAG_TAG,
+                    "sample +${now - diagStartMs}ms " +
+                        "state=${playbackStateName(p.playbackState)} bufPos=$bufPos " +
+                        "delta=${delta}ms bytesRecv=${networkBytesReceivedInSession / 1024}KB pct=${p.bufferedPercentage} " +
+                        "playWhenReady=${p.playWhenReady} stalledFor=${stalledSamples * 2}s (bufTime=${continuousBufferingSamples * 2}s) | $rawUrl"
+                )
+                if (stalledSamples == 5 || continuousBufferingSamples == 8) {
+                    Logger.warn(
+                        PLAYBACK_DIAG_TAG,
+                        "NO PROGRESS for 10s — buffer has not advanced. | $rawUrl"
+                    )
+                }
+
+                // Mid-stream or initial stall recovery over Tor.
+                // Escape after 22s of stalls or 24s (12 samples) of continuous buffering on Tor
+                val stallThresholdSamples = if (com.noslop.app.net.HttpClientProvider.useTorForClearnet) 11 else 5
+                val continuousBufferingCeiling = if (com.noslop.app.net.HttpClientProvider.useTorForClearnet) 12 else 8
+                val isStalled = (stalledSamples >= stallThresholdSamples || continuousBufferingSamples >= continuousBufferingCeiling)
+                // --- NOSLOP_ONSCREEN_RECOVERY_V1 ---
+                // The old stream keeps playing while the new one resolves, so starting early costs little.
+                val recoverEarly = com.noslop.app.net.HttpClientProvider.useTorForClearnet && shouldRecoverEarly(
+                    hasPlayed = awayRecovery.hasPlayed,
+                    attemptsUsed = awayRecovery.attempts,
+                    stalledSamples = stalledSamples,
+                    starved = awayRecovery.rebuffering.isStarved
+                )
+                if ((isStalled || recoverEarly) && url.contains("googlevideo") && currentCanRetry) {
+                    Logger.warn(
+                        PLAYBACK_DIAG_TAG,
+                        "Stream stalled in BUFFERING (stalledFor=${stalledSamples * 2}s, bufTime=${continuousBufferingSamples * 2}s, starved=${awayRecovery.rebuffering.isStarved}, app=${appStateLabel()}) — escaping to fresh Tor circuit at pos=${p.currentPosition}ms: $rawUrl"
+                    )
+                    val curPos = p.currentPosition
+                    if (curPos > 0L) {
+                        PlaybackPositionStore.save(rawUrl, curPos, p.duration)
+                    }
+                    if (recoverInPlace(p, "stall", freshCircuit = true)) {
+                        stalledSamples = 0
+                        continuousBufferingSamples = 0
+                        continue
+                    }
+                    if (isStalled) {
+                        stalledSamples = 0
+                        continuousBufferingSamples = 0
+                        val videoId = YouTubeInternalClient.extractVideoId(rawUrl)
+                        if (videoId != null) {
+                            com.noslop.app.feeds.api.YouTubeInternalClient.advanceStreamNonce(videoId)
+                        }
+                        com.noslop.app.ui.PreloadManager.invalidate(rawUrl)
+                        sourceCache.keys.removeAll { it.startsWith("$rawUrl||") }
+                        onRetry()
+                        return@LaunchedEffect
+                    }
+                }
+
+                if (stalledSamples >= stallThresholdSamples && !currentCanRetry) {
+                    Logger.warn(
+                        PLAYBACK_DIAG_TAG,
+                        "Still zero bytes after retries — giving up on this " +
+                            "video rather than fetching it outside Tor. | $rawUrl"
+                    )
+                    com.noslop.app.tor.TorService.setTorStatusMessage(
+                        "This video could not be loaded over Tor. Skipping it."
+                    )
+                    kotlinx.coroutines.delay(3000L)
+                    com.noslop.app.tor.TorService.setTorStatusMessage(null)
+                    return@LaunchedEffect
+                }
+                lastBufPos = bufPos
+            } catch (e: Exception) {
+                Logger.debug(PLAYBACK_DIAG_TAG, "sampler failed: ${e.message}")
+                return@LaunchedEffect
+            }
+        }
+    }
+
+    // Keyed on retryKey as well as url: a forced re-resolve can legitimately
+    // return the *same* URL (a plain mp4 that 503'd, say), and without the
+    // extra key the effect would not re-run and the slide would sit dead.
+    DisposableEffect(url, retryKey) {
+        Logger.info("VIDEO", "Loading video in ExoPlayer: $url (attempt ${retryKey + 1})")
+        hasError = false
+        isBuffering = true
+        // release() reports its own timeout as a player error. A player on its way out needs no retry.
+        var playerDisposed = false
+
+        // Pass the resolved URL: PreloadManager rejects a warm player whose
+        // baked-in URL has expired or no longer matches what we just resolved.
+        // NOSLOP_KEEP_SWIPED_V1 — notices audio output changes; the slide's listener is removed when it goes.
+        PreloadManager.watchAudioRoute(context)
+        var uiListener: androidx.media3.common.Player.Listener? = null
+        val preloaded = PreloadManager.claim(rawUrl, url)
+        val player = if (preloaded != null) {
+            preloaded.apply {
+                // Do not start audio immediately on claim: wait for SurfaceView attachment and first frame
+                playWhenReady = false
+                // --- NOSLOP_WARM_START_SYNC_V1 ---
+                // The line above only ever lasted until LaunchedEffect(isVisible, exoPlayer) ran.
+                warmStartHeld = holdsAudioForFirstFrame(
+                    playbackState = playbackState,
+                    hasVideoTrack = currentTracks.isTypeSelected(androidx.media3.common.C.TRACK_TYPE_VIDEO),
+                    hasError = playerError != null,
+                    appOnScreen = lifecycleOwner.lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)
+                )
+                
+                val resumeMs = PlaybackPositionStore.resumePositionFor(rawUrl)
+                // Only seek preloaded video if user watched deeply (>= 8s); micro-seeks destroy the pre-warmed buffer
+                if (resumeMs >= 8000L && Math.abs(currentPosition - resumeMs) > 3000L) {
+                    Logger.info("VIDEO", "Resuming preloaded video at ${resumeMs}ms: $rawUrl")
+                    seekTo(resumeMs)
+                }
+
+                if (playbackState == androidx.media3.common.Player.STATE_READY) {
+                    onReady()
+                }
+
+                addListener(object : androidx.media3.common.Player.Listener {
+                    override fun onPlaybackStateChanged(playbackState: Int) {
+                        isBuffering = playbackState == androidx.media3.common.Player.STATE_BUFFERING
+                        // --- NOSLOP_PLAYBACK_DIAG_V1 ---
+                        logPlaybackState(this@apply, playbackState, rawUrl, diagStartMs)
+                        if (playbackState == androidx.media3.common.Player.STATE_READY) {
+                            val hasVideo = currentTracks.isTypeSelected(androidx.media3.common.C.TRACK_TYPE_VIDEO)
+                            if (!hasVideo) {
+                                warmStartHeld = false
+                                onReady()
+                                if (currentIsVisible && !userPaused) play()
+                            }
+                        }
+                    }
+                    override fun onRenderedFirstFrame() {
+                        // --- NOSLOP_PLAYBACK_DIAG_V1 --- the only proof a pixel reached the surface
+                        Logger.info(
+                            PLAYBACK_DIAG_TAG,
+                            "FIRST FRAME rendered +${System.currentTimeMillis() - diagStartMs}ms | $rawUrl"
+                        )
+                        warmStartHeld = false
+                        onReady()
+                        if (currentIsVisible && !userPaused) {
+                            play()
+                        }
+                    }
+                    override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                        videoSizeState = videoSize
+                    }
+                    override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                        if (playerDisposed) return
+                        if (currentCanRetry && recoverInPlace(this@apply, "error ${error.errorCode}", freshCircuit = false, streamCanRecover = isRecoverablePlaybackError(error))) return
+                        if (isRecoverablePlaybackError(error) && currentCanRetry) {
+                            Logger.warn("VIDEO", "Recoverable playback error (code=${error.errorCode}, app=${appStateLabel()}) for $url — re-resolving a fresh stream URL...")
+                            com.noslop.app.ui.PreloadManager.invalidate(rawUrl)
+                            onRetry()
+                        } else {
+                            hasError = true
+                            errorMessage = error.message ?: "Playback failed"
+                            Logger.error("VIDEO", "ExoPlayer error: ${error.message} (code=${error.errorCode}, retries=$retryKey) | URL: $url", error.stackTraceToString())
+                            // --- NOSLOP_PLAYBACK_DIAG_V1 --- named code + full cause chain
+                            Logger.error(
+                                PLAYBACK_DIAG_TAG,
+                                "FAILED ${errorCodeName(error)} after ${System.currentTimeMillis() - diagStartMs}ms " +
+                                    "| causes: ${causeChain(error)} | ${describeStreamUrl(url)}"
+                            )
+                        }
+                    }
+                }.also { uiListener = it })
+                isBuffering = playbackState == androidx.media3.common.Player.STATE_BUFFERING
+                if (playbackState == androidx.media3.common.Player.STATE_READY) {
+                    onReady()
+                }
+                
+                // If the player already encountered an error (e.g. 403) in the background before we claimed it,
+                // the listener won't fire retroactively. We must handle it here.
+                playerError?.let { error ->
+                    if (isRecoverablePlaybackError(error) && canRetry) {
+                        Logger.warn("VIDEO", "Preloaded player already failed (code=${error.errorCode}) for $url — re-resolving...")
+                        com.noslop.app.ui.PreloadManager.invalidate(rawUrl)
+                        onRetry()
+                    } else {
+                        hasError = true
+                        errorMessage = error.message ?: "Playback failed"
+                        Logger.error("VIDEO", "Preloaded ExoPlayer had prior error: ${error.message} (code=${error.errorCode}) | URL: $url")
+                    }
+                }
+            }
+        } else {
+            val client = mediaClientFor(url, rawUrl)
+            val transferListener = object : androidx.media3.datasource.TransferListener {
+                override fun onTransferInitializing(source: androidx.media3.datasource.DataSource, dataSpec: androidx.media3.datasource.DataSpec, isNetwork: Boolean) {}
+                override fun onTransferStart(source: androidx.media3.datasource.DataSource, dataSpec: androidx.media3.datasource.DataSpec, isNetwork: Boolean) {}
+                override fun onBytesTransferred(source: androidx.media3.datasource.DataSource, dataSpec: androidx.media3.datasource.DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
+                    if (isNetwork && bytesTransferred > 0) {
+                        lastNetworkByteTimeMs = System.currentTimeMillis()
+                        networkBytesReceivedInSession += bytesTransferred
+                        com.noslop.app.tor.TorService.noteMediaProgress()
+                    }
+                }
+                override fun onTransferEnd(source: androidx.media3.datasource.DataSource, dataSpec: androidx.media3.datasource.DataSpec, isNetwork: Boolean) {}
+            }
+            val httpDataSourceFactory = androidx.media3.datasource.okhttp.OkHttpDataSource.Factory(client)
+                .setTransferListener(transferListener)
+            // NOSLOP_CHUNKED_STREAM_V1 — googlevideo in 8 MiB pieces (ChunkedRangeDataSource)
+            val dataSourceFactory = androidx.media3.datasource.DefaultDataSource.Factory(context, ChunkedRangeDataSource.Factory(httpDataSourceFactory))
+                .setTransferListener(transferListener)
+            val mediaSourceFactory = androidx.media3.exoplayer.source.DefaultMediaSourceFactory(dataSourceFactory)
+
+            val renderersFactory = androidx.media3.exoplayer.DefaultRenderersFactory(context).apply {
+                setAllowedVideoJoiningTimeMs(0L)
+                setEnableDecoderFallback(true)
+            }
+
+            // NOSLOP_KEEP_SWIPED_V1 — on screen this is the same 50 s / 75 s / 1.2 s / 4 s with a 60 s back
+            // buffer as before (AdaptiveTorLoadControl's foreground settings). Kept for a swipe back, it
+            // stops downloading ahead so it doesn't compete with the video on screen.
+            val loadControl = com.noslop.app.ui.AdaptiveTorLoadControl(
+                isForeground = { PreloadManager.currentlyPlayingUrl == rawUrl },
+                isKept = { PreloadManager.isKept(rawUrl) }
+            )
+
+            androidx.media3.exoplayer.ExoPlayer.Builder(context, renderersFactory)
+                .setMediaSourceFactory(mediaSourceFactory)
+                .setLoadControl(loadControl)
+                .setSeekParameters(androidx.media3.exoplayer.SeekParameters.CLOSEST_SYNC)
+                .setAudioAttributes(
+                    androidx.media3.common.AudioAttributes.Builder()
+                        .setUsage(androidx.media3.common.C.USAGE_MEDIA)
+                        .setContentType(androidx.media3.common.C.AUDIO_CONTENT_TYPE_MOVIE)
+                        .build(),
+                    true
+                )
+                .build().apply {
+                    val quality = com.noslop.app.NoSlopApp.repository.mediaSettingsFlow.value.videoQuality
+                    trackSelectionParameters = trackSelectionParameters.buildUpon().apply {
+                        when (quality) {
+                            "low" -> setMaxVideoSize(854, 480)
+                            "medium" -> setMaxVideoSize(1280, 720)
+                            else -> clearVideoSizeConstraints()
+                        }
+                    }.build()
+
+                    val mimeType = when {
+                        url.contains(".m3u8", ignoreCase = true) || url.contains("hls", ignoreCase = true) -> androidx.media3.common.MimeTypes.APPLICATION_M3U8
+                        url.contains(".mpd", ignoreCase = true) -> androidx.media3.common.MimeTypes.APPLICATION_MPD
+                        else -> androidx.media3.common.MimeTypes.VIDEO_MP4
+                    }
+                    val mediaItem = androidx.media3.common.MediaItem.Builder()
+                        .setUri(url)
+                        .setMimeType(mimeType)
+                        .build()
+                    setMediaItem(mediaItem)
+                    repeatMode = androidx.media3.exoplayer.ExoPlayer.REPEAT_MODE_ONE
+                    
+                    val resumeMs = PlaybackPositionStore.resumePositionFor(rawUrl)
+                    if (resumeMs >= 8000L) {
+                        Logger.info("VIDEO", "Resuming video at ${resumeMs}ms: $rawUrl")
+                        seekTo(resumeMs)
+                    }
+
+                    // Cancel redundant background prewarm for this exact URL to prevent bandwidth contention
+                    com.noslop.app.ui.PreloadManager.invalidate(rawUrl)
+                    com.noslop.app.ui.PreloadManager.currentlyPlayingUrl = rawUrl
+                    addListener(object : androidx.media3.common.Player.Listener {
+                        override fun onPlaybackStateChanged(playbackState: Int) {
+                            isBuffering = playbackState == androidx.media3.common.Player.STATE_BUFFERING
+                            if (playbackState == androidx.media3.common.Player.STATE_READY) {
+                                onReady()
+                            }
+                        }
+                        override fun onRenderedFirstFrame() {
+                            onReady()
+                            if (currentIsVisible && !userPaused) {
+                                play()
+                            }
+                        }
+                        override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                            videoSizeState = videoSize
+                        }
+                        override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                            if (playerDisposed) return
+                            if (currentCanRetry && recoverInPlace(this@apply, "error ${error.errorCode}", freshCircuit = false, streamCanRecover = isRecoverablePlaybackError(error))) return
+                            if (isRecoverablePlaybackError(error) && currentCanRetry) {
+                                Logger.warn("VIDEO", "Recoverable playback error (code=${error.errorCode}, app=${appStateLabel()}) for $url — re-resolving a fresh stream URL...")
+                                com.noslop.app.ui.PreloadManager.invalidate(rawUrl)
+                                onRetry()
+                            } else {
+                                hasError = true
+                                errorMessage = error.message ?: "Playback failed"
+                                Logger.error("VIDEO", "ExoPlayer error: ${error.message} (code=${error.errorCode}, retries=$retryKey) | URL: $url", error.stackTraceToString())
+                            // --- NOSLOP_PLAYBACK_DIAG_V1 --- named code + full cause chain
+                            Logger.error(
+                                PLAYBACK_DIAG_TAG,
+                                "FAILED ${errorCodeName(error)} after ${System.currentTimeMillis() - diagStartMs}ms " +
+                                    "| causes: ${causeChain(error)} | ${describeStreamUrl(url)}"
+                            )
+                            }
+                        }
+                    }.also { uiListener = it })
+                    AvSyncDiagnostics.attach(this, "fresh", rawUrl)
+                    prepare()
+                    playWhenReady = isVisible
+                }
+        }
+        exoPlayer = player
+
+        onDispose {
+            playerDisposed = true
+            if (com.noslop.app.ui.PreloadManager.currentlyPlayingUrl == rawUrl) {
+                com.noslop.app.ui.PreloadManager.currentlyPlayingUrl = null
+            }
+            try {
+                val currentPos = player.currentPosition
+                Logger.debug("VIDEO_DEBUG", "onDispose called. currentPos=$currentPos, duration=${player.duration}, rawUrl=$rawUrl")
+                if (currentPos >= 8000L) {
+                    PlaybackPositionStore.save(rawUrl, currentPos, player.duration)
+                }
+            } catch (e: Exception) {
+                Logger.debug("VIDEO_DEBUG", "Failed to save playback position during dispose: ${e.message}")
+            }
+            // --- NOSLOP_KEEP_SWIPED_V1 ---
+            // A healthy player is kept, paused where it is, for a swipe back; anything else is released.
+            uiListener?.let { player.removeListener(it) }
+            if (!PreloadManager.keep(rawUrl, url, player)) {
+                player.release()
+            }
+            exoPlayer = null
+            // The teardown now runs after the next slide has started: leave its flag alone.
+            if (com.noslop.app.ui.PreloadManager.currentlyPlayingUrl == null) {
+                com.noslop.app.ui.PreloadManager.isVideoActive = false
+            }
+        }
+    }
+
+    LaunchedEffect(exoPlayer) {
+        val player = exoPlayer ?: return@LaunchedEffect
+        var lastSavedPos = -1L
+        while (true) {
+            kotlinx.coroutines.delay(5000L)
+            try {
+                val currentPos = player.currentPosition
+                if (currentPos > 0L && currentPos != lastSavedPos) {
+                    PlaybackPositionStore.save(rawUrl, currentPos, player.duration)
+                    lastSavedPos = currentPos
+                }
+            } catch (e: Exception) {
+                break
+            }
+        }
+    }
+
+    val scope = rememberCoroutineScope()
+    var isPlaying by remember { mutableStateOf(isVisible) }
+    var isFastForwarding by remember { mutableStateOf(false) }
+    var seekIndicator by remember { mutableStateOf<String?>(null) }
+
+    var currentPositionMs by remember { mutableStateOf(0L) }
+    var totalDurationMs by remember { mutableStateOf(0L) }
+    var isScrubbing by remember { mutableStateOf(false) }
+    var scrubProgress by remember { mutableStateOf(0f) }
+    var showTimeline by remember { mutableStateOf(false) }
+    var lastInteractionTime by remember { mutableStateOf(0L) }
+
+    LaunchedEffect(exoPlayer, isVisible, isScrubbing) {
+        val player = exoPlayer ?: return@LaunchedEffect
+        while (isVisible) {
+            if (!isScrubbing) {
+                currentPositionMs = player.currentPosition.coerceAtLeast(0L)
+                val d = player.duration
+                totalDurationMs = if (d > 0L) d else 0L
+            }
+            kotlinx.coroutines.delay(300L)
+        }
+    }
+
+    LaunchedEffect(showTimeline, isPlaying, isScrubbing, lastInteractionTime) {
+        if (showTimeline && isPlaying && !isScrubbing) {
+            kotlinx.coroutines.delay(3500L)
+            showTimeline = false
+        }
+    }
+
+    val isActivelyPlaying = isVisible && isPlaying && !hasError
+    val activity = remember(context) {
+        var ctx = context
+        while (ctx is android.content.ContextWrapper) {
+            if (ctx is android.app.Activity) return@remember ctx
+            ctx = ctx.baseContext
+        }
+        null
+    }
+
+    DisposableEffect(isActivelyPlaying) {
+        if (isActivelyPlaying) {
+            activity?.window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            activity?.window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            activity?.window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    LaunchedEffect(seekIndicator) {
+        if (seekIndicator != null) {
+            kotlinx.coroutines.delay(800)
+            seekIndicator = null
+        }
+    }
+    
+    LaunchedEffect(exoPlayer) {
+        val player = exoPlayer ?: return@LaunchedEffect
+        val listener = object : androidx.media3.common.Player.Listener {
+            override fun onIsPlayingChanged(playing: Boolean) {
+                isPlaying = playing
+            }
+        }
+        player.addListener(listener)
+        try {
+            kotlinx.coroutines.awaitCancellation()
+        } finally {
+            // NOSLOP_KEEP_SWIPED_V1 — a kept player outlives this slide.
+            player.removeListener(listener)
+        }
+    }
+
+    Box(
+        modifier = Modifier.fillMaxSize().pointerInput(exoPlayer) {
+            detectTapGestures(
+                onPress = {
+                    showTimeline = true
+                    lastInteractionTime = System.currentTimeMillis()
+                    val player = exoPlayer ?: return@detectTapGestures
+                    val holdJob = scope.launch {
+                        kotlinx.coroutines.delay(400)
+                        isFastForwarding = true
+                        player.playbackParameters = androidx.media3.common.PlaybackParameters(2.0f)
+                    }
+                    try {
+                        awaitRelease()
+                    } finally {
+                        holdJob.cancel()
+                        if (isFastForwarding) {
+                            isFastForwarding = false
+                            player.playbackParameters = androidx.media3.common.PlaybackParameters(1.0f)
+                        }
+                    }
+                },
+                onDoubleTap = { offset ->
+                    val player = exoPlayer ?: return@detectTapGestures
+                    showTimeline = true
+                    lastInteractionTime = System.currentTimeMillis()
+                    val width = size.width
+                    if (offset.x > width / 2) {
+                        player.seekTo(player.currentPosition + 10000)
+                        seekIndicator = "+10s ⏩"
+                    } else {
+                        player.seekTo(maxOf(0, player.currentPosition - 10000))
+                        seekIndicator = "-10s ⏪"
+                    }
+                },
+                onTap = {
+                    val player = exoPlayer
+                    if (player != null) {
+                        player.playWhenReady = !player.playWhenReady
+                        isPlaying = player.playWhenReady
+                        userPaused = !player.playWhenReady
+                        showTimeline = true
+                        lastInteractionTime = System.currentTimeMillis()
+                    }
+                }
+            )
+        },
+        contentAlignment = Alignment.Center
+    ) {
+        if (!hasError) {
+            AndroidView(
+                factory = { ctx ->
+                    androidx.media3.ui.PlayerView(ctx).apply {
+                        layoutParams = android.view.ViewGroup.LayoutParams(
+                            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                            android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                        player = exoPlayer
+                        useController = false
+                        // --- NOSLOP_ONSCREEN_RECOVERY_V1 --- a recovery swaps the source under this view
+                        setKeepContentOnPlayerReset(true)
+                        artworkDisplayMode = androidx.media3.ui.PlayerView.ARTWORK_DISPLAY_MODE_OFF
+                        keepScreenOn = isActivelyPlaying
+                        resizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    }
+                },
+                update = { view ->
+                    val temp = videoSizeState
+                    view.player = exoPlayer
+                    view.keepScreenOn = isActivelyPlaying
+                    view.resizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT
+                    if (temp.width > 0 && temp.height > 0) {
+                        view.requestLayout()
+                    }
+                },
+                onRelease = { view ->
+                    view.player = null
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+
+            // Render buffering animation on top of the native AndroidView with zIndex(5f)
+            if (isBuffering) {
+                if (thumbnailUrl == null && thumbnailB64 == null) {
+                    com.noslop.app.ui.LoadingShimmer(modifier = Modifier.zIndex(5f))
+                } else {
+                    VideoLoadingOverlay(label = "Buffering".tr, modifier = Modifier.zIndex(5f))
+                }
+            }
+            
+            if (isFastForwarding) {
+                Surface(
+                    color = PrimaryBlack.copy(alpha = 0.75f),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 16.dp).zIndex(2f)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("2x ▶▶".tr, color = AccentGreen, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    }
+                }
+            }
+
+            if (seekIndicator != null) {
+                Surface(
+                    color = PrimaryBlack.copy(alpha = 0.75f),
+                    shape = RoundedCornerShape(20.dp),
+                    modifier = Modifier.align(Alignment.Center).zIndex(2f)
+                ) {
+                    Text(
+                        text = seekIndicator!!,
+                        color = AccentGreen,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 18.sp,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
+                    )
+                }
+            }
+
+            if (!isPlaying && !isBuffering && exoPlayer != null) {
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .background(PrimaryBlack.copy(alpha = 0.5f), shape = CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        Icons.Filled.PlayArrow,
+                        contentDescription = "Play",
+                        tint = TextLight,
+                        modifier = Modifier.size(40.dp)
+                    )
+                }
+            }
+
+            // Interactive Video Scrubber / Playhead Timeline (Auto-hiding with tap-to-reveal)
+            androidx.compose.animation.AnimatedVisibility(
+                visible = (showTimeline || isScrubbing || !isPlaying) && totalDurationMs > 0L,
+                enter = androidx.compose.animation.fadeIn(),
+                exit = androidx.compose.animation.fadeOut(),
+                modifier = Modifier.align(Alignment.BottomCenter).zIndex(6f)
+            ) {
+                val displayPosition = if (isScrubbing) (scrubProgress * totalDurationMs).toLong() else currentPositionMs
+                val formatTime = { ms: Long ->
+                    val totalSec = (ms / 1000).coerceAtLeast(0)
+                    val m = totalSec / 60
+                    val s = totalSec % 60
+                    String.format("%02d:%02d", m, s)
+                }
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(PrimaryBlack.copy(alpha = 0.5f), shape = RoundedCornerShape(8.dp))
+                            .padding(horizontal = 8.dp, vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = formatTime(displayPosition),
+                            color = TextLight,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Slider(
+                            value = if (totalDurationMs > 0L) (displayPosition.toFloat() / totalDurationMs.toFloat()).coerceIn(0f, 1f) else 0f,
+                            onValueChange = { frac ->
+                                isScrubbing = true
+                                showTimeline = true
+                                scrubProgress = frac
+                            },
+                            onValueChangeFinished = {
+                                val seekTarget = (scrubProgress * totalDurationMs).toLong()
+                                exoPlayer?.seekTo(seekTarget)
+                                currentPositionMs = seekTarget
+                                isScrubbing = false
+                                lastInteractionTime = System.currentTimeMillis()
+                            },
+                            modifier = Modifier.weight(1f).padding(horizontal = 6.dp),
+                            colors = SliderDefaults.colors(
+                                thumbColor = AccentGreen,
+                                activeTrackColor = AccentGreen,
+                                inactiveTrackColor = TextMuted.copy(alpha = 0.3f)
+                            )
+                        )
+                        Text(
+                            text = formatTime(totalDurationMs),
+                            color = TextMuted,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                    }
+                }
+            }
+        } else {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier
+                    .background(PrimaryBlack.copy(alpha = 0.7f))
+                    .padding(16.dp)
+            ) {
+                Icon(Icons.Default.Warning, contentDescription = null, tint = AccentGreen, modifier = Modifier.size(48.dp))
+                Spacer(modifier = Modifier.height(16.dp))
+                Text("Video unavailable".tr, color = TextLight, fontWeight = FontWeight.Bold)
+                Text(
+                    errorMessage,
+                    color = TextMuted,
+                    style = MaterialTheme.typography.bodySmall,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(horizontal = 32.dp)
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+                Button(
+                    onClick = onRetry,
+                    colors = ButtonDefaults.buttonColors(containerColor = AccentGreen)
+                ) {
+                    Text("Retry Playback".tr, color = PrimaryBlack, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun EmbedWebViewPlayer(url: String, rawUrl: String, isVisible: Boolean, onRetry: () -> Unit, onReady: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var webError by remember { mutableStateOf<String?>(null) }
+    var currentIsVisible by remember { mutableStateOf(isVisible) }
+    var webViewRef by remember { mutableStateOf<android.webkit.WebView?>(null) }
+    var isFastForwarding by remember { mutableStateOf(false) }
+    var seekIndicator by remember { mutableStateOf<String?>(null) }
+
+    val isActivelyPlaying = isVisible && (webError == null)
+    val activity = remember(context) {
+        var ctx = context
+        while (ctx is android.content.ContextWrapper) {
+            if (ctx is android.app.Activity) return@remember ctx
+            ctx = ctx.baseContext
+        }
+        null
+    }
+
+    DisposableEffect(isActivelyPlaying) {
+        if (isActivelyPlaying) {
+            activity?.window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            activity?.window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            activity?.window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    LaunchedEffect(isVisible) {
+        currentIsVisible = isVisible
+    }
+
+    LaunchedEffect(seekIndicator) {
+        if (seekIndicator != null) {
+            kotlinx.coroutines.delay(800)
+            seekIndicator = null
+        }
+    }
+
+    if (webError != null) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier
+                .fillMaxSize()
+                .background(PrimaryBlack.copy(alpha = 0.7f))
+                .padding(16.dp),
+            verticalArrangement = Arrangement.Center
+        ) {
+            Icon(Icons.Default.Warning, contentDescription = null, tint = AccentGreen, modifier = Modifier.size(48.dp))
+            Spacer(modifier = Modifier.height(16.dp))
+            Text("Embed unavailable".tr, color = TextLight, fontWeight = FontWeight.Bold)
+            Text(
+                webError!!,
+                color = TextMuted,
+                style = MaterialTheme.typography.bodySmall,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 32.dp)
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Button(
+                onClick = onRetry,
+                colors = ButtonDefaults.buttonColors(containerColor = AccentGreen)
+            ) {
+                Text("Retry Embed".tr, color = PrimaryBlack, fontWeight = FontWeight.Bold)
+            }
+        }
+    } else {
+        Box(modifier = Modifier.fillMaxSize()) {
+            AndroidView(
+                factory = { ctx ->
+                    object : android.webkit.WebView(ctx) {
+                        override fun onWindowVisibilityChanged(visibility: Int) {
+                            if (visibility != android.view.View.GONE) {
+                                super.onWindowVisibilityChanged(android.view.View.VISIBLE)
+                            }
+                        }
+                    }.apply {
+                        webViewRef = this
+                        keepScreenOn = isActivelyPlaying
+                        setLayerType(android.view.View.LAYER_TYPE_HARDWARE, null)
+                        layoutParams = android.view.ViewGroup.LayoutParams(
+                            android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                            android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                        setBackgroundColor(android.graphics.Color.BLACK)
+
+                        with(settings) {
+                            javaScriptEnabled = true
+                            mediaPlaybackRequiresUserGesture = false
+                            domStorageEnabled = true
+                            allowFileAccess = false
+                            allowContentAccess = false
+                            useWideViewPort = true
+                            loadWithOverviewMode = true
+                            mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                            userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                        }
+
+                        webChromeClient = android.webkit.WebChromeClient()
+
+                        val baseUrl = when {
+                            url.contains("youtube") || url.contains("youtu.be") || url.contains("youtube-nocookie") -> "https://noslop.me/"
+                            url.contains("vimeo") -> "https://vimeo.com/"
+                            else -> "https://archive.org/"
+                        }
+
+                        addJavascriptInterface(object {
+                            @android.webkit.JavascriptInterface
+                            fun onPlaying() {
+                                post { onReady() }
+                            }
+
+                            @android.webkit.JavascriptInterface
+                            fun savePosition(timeSeconds: Float) {
+                                val timeMs = (timeSeconds * 1000).toLong()
+                                if (timeMs > 0) {
+                                    PlaybackPositionStore.save(rawUrl, timeMs, 0L)
+                                }
+                            }
+                        }, "NoSlopJS")
+
+                        webViewClient = object : android.webkit.WebViewClient() {
+                            override fun shouldOverrideUrlLoading(
+                                view: android.webkit.WebView?,
+                                request: android.webkit.WebResourceRequest?
+                            ): Boolean {
+                                val targetUri = request?.url ?: return false
+                                val scheme = targetUri.scheme ?: return false
+
+                                if (scheme == "data" || scheme == "blob") return false
+
+                                val targetHost = targetUri.host ?: return false
+                                val currentHost = android.net.Uri.parse(baseUrl).host ?: return false
+
+                                if (targetHost == currentHost) return false
+
+                                val mediaFamily = setOf(
+                                    "youtube-nocookie.com", "youtube.com", "www.youtube.com",
+                                    "googlevideo.com", "yt3.ggpht.com", "i.ytimg.com",
+                                    "vimeo.com", "player.vimeo.com", "archive.org",
+                                    "noslop.me"
+                                )
+                                if (mediaFamily.any { targetHost.endsWith(it) }) return false
+
+                                Logger.info("VIDEO", "Blocked outbound navigation to $targetHost")
+                                return true
+                            }
+
+                            override fun onPageFinished(view: android.webkit.WebView?, pageUrl: String?) {
+                                val shouldAutoplay = currentIsVisible
+                                val js = """
+                                    (function() {
+                                        document.body.style.backgroundColor = 'black';
+                                        window.noslopSeekRelative = function(sec) {
+                                            if (typeof player !== 'undefined' && player.getCurrentTime && player.seekTo) {
+                                                var curr = player.getCurrentTime();
+                                                player.seekTo(Math.max(0, curr + sec), true);
+                                            } else {
+                                                var vid = document.querySelector('video');
+                                                if (vid) { vid.currentTime = Math.max(0, vid.currentTime + sec); }
+                                            }
+                                        };
+                                        window.noslopSetSpeed = function(rate) {
+                                            if (typeof player !== 'undefined' && player.setPlaybackRate) {
+                                                player.setPlaybackRate(rate);
+                                            } else {
+                                                var vid = document.querySelector('video');
+                                                if (vid) { vid.playbackRate = rate; }
+                                            }
+                                        };
+                                        window.noslopTogglePlay = function() {
+                                            if (typeof player !== 'undefined' && player.getPlayerState) {
+                                                var state = player.getPlayerState();
+                                                if (state === 1) { player.pauseVideo(); } else { player.playVideo(); }
+                                            } else {
+                                                var vid = document.querySelector('video');
+                                                if (vid) {
+                                                    if (vid.paused) { vid.play().catch(function(){}); } else { vid.pause(); }
+                                                }
+                                            }
+                                        };
+                                        if ($shouldAutoplay) {
+                                            if (typeof player !== 'undefined' && player.playVideo) {
+                                                player.playVideo();
+                                            } else {
+                                                var vid = document.querySelector('video');
+                                                if (vid) { vid.play().catch(function(){}); return; }
+                                                var btn = document.querySelector(
+                                                    '.play-button, button[aria-label="Play"], button[title="Play"], [data-testid="play-button"]'
+                                                );
+                                                if (btn) btn.click();
+                                            }
+                                        }
+                                    })();
+                                """.trimIndent()
+                                view?.evaluateJavascript(js, null)
+                                
+                                val isYouTube = url.contains("youtube") || url.contains("youtu.be") || url.contains("youtube-nocookie")
+                                if (!isYouTube) {
+                                    view?.postDelayed({ onReady() }, 800)
+                                }
+                            }
+
+                            override fun onReceivedError(
+                                view: android.webkit.WebView?,
+                                request: android.webkit.WebResourceRequest?,
+                                error: android.webkit.WebResourceError?
+                            ) {
+                                if (request?.isForMainFrame == true) {
+                                    webError = error?.description?.toString() ?: "Unknown Network/SSL Error"
+                                }
+                            }
+                        }
+
+                        val isYouTube = url.contains("youtube") || url.contains("youtu.be") || url.contains("youtube-nocookie")
+                        
+                        val htmlContent = if (isYouTube) {
+                            val videoId = url.substringAfter("/embed/").substringBefore("?")
+                            val resumeMs = PlaybackPositionStore.resumePositionFor(rawUrl)
+                            val startSeconds = (resumeMs / 1000).toInt()
+                            // --- NOSLOP_EMBED_AUTOPLAY_V1 ---
+                            // Injected as a JS literal. The old code read
+                            // window.NoSlop_isVisible, which nothing ever assigns.
+                            val shouldAutoplayEmbed = if (currentIsVisible) "true" else "false"
+                            """
+                            <!DOCTYPE html>
+                            <html>
+                            <head>
+                                <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+                                <style>body, html { margin:0; padding:0; width:100%; height:100%; background:black; }</style>
+                            </head>
+                            <body>
+                                <div id="player"></div>
+                                <script>
+                                  var tag = document.createElement('script');
+                                  tag.src = "https://www.youtube.com/iframe_api";
+                                  var firstScriptTag = document.getElementsByTagName('script')[0];
+                                  firstScriptTag.parentNode.insertBefore(tag, firstScriptTag);
+                                  var player;
+                                  function onYouTubeIframeAPIReady() {
+                                    player = new YT.Player('player', {
+                                      height: '100%',
+                                      width: '100%',
+                                      videoId: '$videoId',
+                                      playerVars: { 'playsinline': 1, 'autoplay': 0, 'controls': 1, 'fs': 0, 'rel': 0, 'start': $startSeconds },
+                                      events: {
+                                        'onReady': function(event) {
+                                            // --- NOSLOP_EMBED_AUTOPLAY_V1 ---
+                                            // Tell the host the player exists as soon as it is
+                                            // constructed. Previously onPlaying() only fired from
+                                            // the PLAYING state, so if autoplay was refused the
+                                            // poster stayed up forever and the user could not even
+                                            // see the play button underneath it.
+                                            window.NoSlopJS.onPlaying();
+                                            if ($shouldAutoplayEmbed) { event.target.playVideo(); }
+                                        },
+                                        'onStateChange': function(event) {
+                                          if (event.data == 1) { // PLAYING state
+                                              window.NoSlopJS.onPlaying();
+                                              if (!window.posInterval) {
+                                                  window.posInterval = setInterval(function() {
+                                                      if (player && player.getCurrentTime) {
+                                                          window.NoSlopJS.savePosition(player.getCurrentTime());
+                                                      }
+                                                  }, 1000);
+                                              }
+                                          } else {
+                                              if (window.posInterval) {
+                                                  clearInterval(window.posInterval);
+                                                  window.posInterval = null;
+                                                  if (player && player.getCurrentTime) {
+                                                      window.NoSlopJS.savePosition(player.getCurrentTime());
+                                                  }
+                                              }
+                                          }
+                                        }
+                                      }
+                                    });
+                                  }
+                                </script>
+                            </body>
+                            </html>
+                            """.trimIndent()
+                        } else {
+                            """
+                            <!DOCTYPE html>
+                            <html>
+                            <head>
+                                <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+                                <meta name="referrer" content="strict-origin-when-cross-origin">
+                                <style>body, html { margin:0; padding:0; width:100%; height:100%; background:black; }</style>
+                            </head>
+                            <body>
+                                <iframe width="100%" height="100%" src="$url" frameborder="0" allow="fullscreen" allowfullscreen></iframe>
+                            </body>
+                            </html>
+                            """.trimIndent()
+                        }
+                        
+                        loadDataWithBaseURL(baseUrl, htmlContent, "text/html", "UTF-8", null)
+                    }
+                },
+                update = { view ->
+                    view.keepScreenOn = isActivelyPlaying
+                    val js = if (isVisible) {
+                        """
+                        if (typeof player !== 'undefined' && player.playVideo) {
+                            player.playVideo();
+                        } else {
+                            var vid = document.querySelector('video');
+                            if (vid && vid.paused) { vid.play().catch(function(){}); }
+                            var btn = document.querySelector('.play-button, button[aria-label="Play"], button[title="Play"], [data-testid="play-button"]');
+                            if (btn) btn.click();
+                        }
+                        """.trimIndent()
+                    } else {
+                        """
+                        if (typeof player !== 'undefined' && player.pauseVideo) {
+                            player.pauseVideo();
+                        } else {
+                            var vid = document.querySelector('video');
+                            if (vid && !vid.paused) { vid.pause(); }
+                        }
+                        """.trimIndent()
+                    }
+                    view.evaluateJavascript(js, null)
+                },
+                onRelease = { view ->
+                    view.evaluateJavascript("if (typeof player !== 'undefined' && player.getCurrentTime) { window.NoSlopJS.savePosition(player.getCurrentTime()); }", null)
+                    view.stopLoading()
+                    view.loadUrl("about:blank")
+                    view.destroy()
+                },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer { 
+                        if (isVisible) {
+                            alpha = 1f
+                            translationX = 0f
+                        } else {
+                            alpha = 0.01f
+                            translationX = 100000f
+                        }
+                    }
+            )
+
+            // Transparent Gesture Overlay for EmbedWebViewPlayer
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .pointerInput(webViewRef) {
+                        detectTapGestures(
+                            onPress = {
+                                val webView = webViewRef ?: return@detectTapGestures
+                                val holdJob = scope.launch {
+                                    kotlinx.coroutines.delay(400)
+                                    isFastForwarding = true
+                                    webView.evaluateJavascript("window.noslopSetSpeed(2.0);", null)
+                                }
+                                try {
+                                    awaitRelease()
+                                } finally {
+                                    holdJob.cancel()
+                                    if (isFastForwarding) {
+                                        isFastForwarding = false
+                                        webView.evaluateJavascript("window.noslopSetSpeed(1.0);", null)
+                                    }
+                                }
+                            },
+                            onDoubleTap = { offset ->
+                                val webView = webViewRef ?: return@detectTapGestures
+                                val width = size.width
+                                if (offset.x > width / 2) {
+                                    webView.evaluateJavascript("window.noslopSeekRelative(10);", null)
+                                    seekIndicator = "+10s ⏩"
+                                } else {
+                                    webView.evaluateJavascript("window.noslopSeekRelative(-10);", null)
+                                    seekIndicator = "-10s ⏪"
+                                }
+                            },
+                            onTap = {
+                                webViewRef?.evaluateJavascript("window.noslopTogglePlay();", null)
+                            }
+                        )
+                    }
+            )
+
+            if (isFastForwarding) {
+                Surface(
+                    color = PrimaryBlack.copy(alpha = 0.75f),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.align(Alignment.TopCenter).padding(top = 16.dp).zIndex(2f)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("2x ▶▶".tr, color = AccentGreen, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    }
+                }
+            }
+
+            if (seekIndicator != null) {
+                Surface(
+                    color = PrimaryBlack.copy(alpha = 0.75f),
+                    shape = RoundedCornerShape(20.dp),
+                    modifier = Modifier.align(Alignment.Center).zIndex(2f)
+                ) {
+                    Text(
+                        text = seekIndicator!!,
+                        color = AccentGreen,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 18.sp,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
+                    )
+                }
+            }
+        }
+    }
+}

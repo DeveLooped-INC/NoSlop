@@ -1,0 +1,251 @@
+// FILE: app/src/main/java/com/noslop/app/NoSlopApp.kt
+package com.noslop.app
+
+import android.app.Application
+import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.Constraints
+import androidx.work.NetworkType
+import androidx.work.WorkManager
+import androidx.work.Configuration
+import androidx.work.ExistingPeriodicWorkPolicy
+import com.noslop.app.debug.Logger
+import com.noslop.app.feeds.FeedSyncWorker
+import com.noslop.app.data.NoSlopDatabase
+import com.noslop.app.data.NoSlopRepository
+import com.noslop.app.mesh.GossipService
+import coil.ImageLoader
+import coil.ImageLoaderFactory
+import com.noslop.app.net.HttpClientProvider
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import org.bouncycastle.jce.provider.BouncyCastleProvider
+import java.security.Security
+import java.util.concurrent.TimeUnit
+
+class NoSlopApp : Application(), Configuration.Provider, ImageLoaderFactory {
+    companion object {
+        lateinit var repository: NoSlopRepository
+            private set
+        lateinit var updateChecker: com.noslop.app.util.UpdateChecker
+            private set
+    }
+
+    private val repositoryScope = com.noslop.app.util.AppScopes.io
+
+    override fun newImageLoader(): ImageLoader {
+        return ImageLoader.Builder(this)
+            // --- NOSLOP_TOR_GATE_UI_V1 ---
+            // Obey the Content-over-Tor toggle like everything else. The old
+            // comment argued these are public CDN links revealing no identity;
+            // the URLs are public but the REQUESTS are not. i.ytimg.com receives
+            // this device's IP together with the id of every video scrolled
+            // past, rebuilding a viewing history as precisely as the stream
+            // fetches we already route through Tor.
+            //
+            // The slow loads that motivated the bypass are addressed below: on
+            // 'low' the app now asks the SOURCE for small images instead of
+            // downloading full-size ones and shrinking them after the bytes
+            // have already crossed the wire.
+            .okHttpClient {
+                val baseClient = HttpClientProvider.activeClearnetClient
+                baseClient.newBuilder()
+                    .addInterceptor { chain ->
+                        val req = chain.request()
+                        val host = req.url.host
+                        val builder = req.newBuilder()
+                        if (host.contains("wikimedia.org") || host.contains("wikipedia.org")) {
+                            builder.header("User-Agent", com.noslop.app.net.NoSlopUserAgent.value)
+                        } else if (host.contains("artic.edu")) {
+                            builder.header("User-Agent", com.noslop.app.net.NoSlopUserAgent.value)
+                            builder.header("AIC-User-Agent", "NoSlop-Android (${com.noslop.app.net.NoSlopUserAgent.CONTACT})")
+                        }
+                        chain.proceed(builder.build())
+                    }
+                    .build()
+            }
+            .components {
+                if (android.os.Build.VERSION.SDK_INT >= 28) {
+                    add(coil.decode.ImageDecoderDecoder.Factory())
+                } else {
+                    add(coil.decode.GifDecoder.Factory())
+                }
+                add(object : coil.intercept.Interceptor {
+                    override suspend fun intercept(chain: coil.intercept.Interceptor.Chain): coil.request.ImageResult {
+                        val request = chain.request
+                        val url = request.data.toString()
+                        if (url.startsWith("noslop://")) {
+                            val resolved = com.noslop.app.ui.resolveMediaUrl(url, this@NoSlopApp)
+                            if (resolved != null) {
+                                val newData = if (resolved.startsWith("file://")) java.io.File(resolved.removePrefix("file://")) else resolved
+                                return chain.proceed(request.newBuilder().data(newData).build())
+                            }
+                        }
+                        return chain.proceed(request)
+                    }
+                })
+                // NOSLOP_MEDIA_ENCRYPTION_V1: after the interceptor above, so it sees the resolved address.
+                com.noslop.app.ui.EncryptedMediaImages.install(this)
+            }
+            .build()
+    }
+
+    override val workManagerConfiguration: Configuration
+        get() = Configuration.Builder()
+            .setMinimumLoggingLevel(android.util.Log.INFO)
+            .build()
+
+    override fun onCreate() {
+        super.onCreate()
+
+        // Must be first — all crypto operations depend on this
+        if (Security.getProvider("BC") == null) {
+            Security.addProvider(BouncyCastleProvider())
+        }
+
+        Logger.initialize(this)
+        Logger.info("APP", "NoSlop initialised. SDK=${android.os.Build.VERSION.SDK_INT}")
+
+        val db = NoSlopDatabase.getDatabase(this)
+        repository = NoSlopRepository(this, db)
+        updateChecker = com.noslop.app.util.UpdateChecker(db.appSettingDao())
+        repositoryScope.launch {
+            updateChecker.loadCachedState()
+            // NOSLOP_STALE_UPDATE_INFO_V1 — an "update available" notice left from before the update was installed.
+            if (updateChecker.updateInfo.value == null) {
+                com.noslop.app.util.NotificationHelper.cancelUpdateNotification(this@NoSlopApp)
+            }
+        }
+
+        com.noslop.app.util.NotificationHelper.createNotificationChannel(this)
+
+        // FIX: Ensure MediaManager is initialized immediately for existing sessions
+        // so that file copies and auto-downloads don't fail with "not initialized" errors.
+        com.noslop.app.mesh.MediaManager.initialize(repository)
+
+        // Hydrate the playback-position store from disk so videos resume where
+        // the user left off, even after a cold start.
+        com.noslop.app.ui.components.PlaybackPositionStore.init(this)
+
+        // Initialize LanguageManager immediately on the main thread so appContext and languages are ready before any UI composes
+        com.noslop.app.util.LanguageManager.init(this, "en")
+        repositoryScope.launch {
+            val appLang = repository.getAppLanguage()
+            if (appLang != "en") {
+                com.noslop.app.util.LanguageManager.loadLanguage(appLang)
+            }
+        }
+
+        // Start media HTTP-to-Tor proxy service
+        com.noslop.app.mesh.MediaProxyService.start()
+
+        // Start embedded Tor daemon early on app start for existing onboarded users
+        repositoryScope.launch {
+            if (repository.isOnboardingComplete()) {
+                // NOSLOP_DB_ENCRYPTION_V1: with a database that can't be opened the app runs on an empty
+                // stand-in. Tor stays off then, so no message can arrive, be acknowledged and be lost.
+                // (isOnboardingComplete only answers true after reading the database, so it is open here.)
+                if (com.noslop.app.data.DbEncryption.isLocked()) return@launch
+                val identity = repository.getLocalIdentity()
+                val burnableIdentity = repository.getBurnableIdentity()
+                val hubStatus = repository.getAppSetting("hub_deployment_status")
+                com.noslop.app.tor.TorService.skipHiddenServiceRegistration = !hubStatus.isNullOrBlank()
+                // NOSLOP_HUB_CREATOR_HOSTING_V1: the creator onion stays here unless the Hub holds it.
+                com.noslop.app.tor.TorService.skipCreatorHiddenServiceRegistration = repository.hubHostsCreator()
+                val fgEnabled = repository.getAppSetting("foreground_service_enabled") == "true"
+                if (fgEnabled && hubStatus.isNullOrBlank()) {
+                    com.noslop.app.mesh.NoSlopForegroundService.start(this@NoSlopApp)
+                }
+                com.noslop.app.tor.TorService.startTor(
+                    this@NoSlopApp,
+                    identity?.privateKeyB64,
+                    burnableIdentity?.privateKeyB64
+                )
+            }
+        }
+
+        repository.meshTransport.startListening()
+        repositoryScope.launch {
+            val identity = repository.getLocalIdentity()
+            if (identity != null) {
+                GossipService.initialize(
+                    repository.peerDao, 
+                    repository.meshTransport, 
+                    identity.publicKeyB64,
+                    getMeshFilterSettings = { repository.getMeshFilterSettings() },
+                    checkEntityExists = { type, id -> repository.checkEntityExistsLocally(type, id) },
+                    checkIsLocalUser = { pub -> repository.isLocalUser(pub) }
+                )
+                repository.startPresenceHeartbeat()
+            }
+        }
+
+        // Background WorkManager feed sync registration (Task 1)
+        try {
+            val syncRequest = PeriodicWorkRequestBuilder<FeedSyncWorker>(15, TimeUnit.MINUTES)
+                .setConstraints(
+                    Constraints.Builder()
+                        .setRequiredNetworkType(NetworkType.CONNECTED)
+                        .build()
+                )
+                .build()
+            WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+                "feed_background_sync",
+                ExistingPeriodicWorkPolicy.KEEP,
+                syncRequest
+            )
+            Logger.info("APP", "WorkManager Periodic feed sync registered successfully")
+        } catch (e: Exception) {
+            Logger.error("APP", "Failed to register WorkManager feed sync: ${e.message}")
+        }
+
+        // Daily check of the latest GitHub release for a newer APK version.
+        // Uses UPDATE (not KEEP, unlike the feed sync above) because this feature is new/evolving —
+        // KEEP would silently freeze whatever schedule/constraints existed from the first install
+        // that ever registered "update_check_daily", ignoring any future tuning here.
+        try {
+            val updateCheckRequest = PeriodicWorkRequestBuilder<com.noslop.app.util.UpdateCheckWorker>(1, TimeUnit.DAYS)
+                .setConstraints(
+                    Constraints.Builder()
+                        .setRequiredNetworkType(NetworkType.CONNECTED)
+                        .build()
+                )
+                .build()
+            WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+                "update_check_daily",
+                ExistingPeriodicWorkPolicy.UPDATE,
+                updateCheckRequest
+            )
+            Logger.info("APP", "WorkManager Periodic update check registered successfully")
+        } catch (e: Exception) {
+            Logger.error("APP", "Failed to register WorkManager update check: ${e.message}")
+        }
+
+        // Daily automated encrypted identity & DB backup push to Home Hub
+        // NOSLOP_HUB_BUILD_SWITCH_V1 — a build without the HUB drops the job an earlier Hub build queued.
+        if (!HubFeature.enabled) {
+            try {
+                WorkManager.getInstance(this).cancelUniqueWork("hub_backup_sync_daily")
+            } catch (e: Exception) {
+                Logger.warn("APP", "Failed to cancel WorkManager Hub sync: ${e.message}")
+            }
+        } else try {
+            val hubSyncRequest = PeriodicWorkRequestBuilder<com.noslop.app.data.HubSyncWorker>(1, TimeUnit.DAYS)
+                .setConstraints(
+                    Constraints.Builder()
+                        .setRequiredNetworkType(NetworkType.CONNECTED)
+                        .build()
+                )
+                .build()
+            WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+                "hub_backup_sync_daily",
+                ExistingPeriodicWorkPolicy.KEEP,
+                hubSyncRequest
+            )
+            Logger.info("APP", "WorkManager Periodic Hub sync registered successfully")
+        } catch (e: Exception) {
+            Logger.error("APP", "Failed to register WorkManager Hub sync: ${e.message}")
+        }
+    }
+}

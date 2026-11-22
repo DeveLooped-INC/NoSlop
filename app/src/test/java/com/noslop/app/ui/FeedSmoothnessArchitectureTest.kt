@@ -1,0 +1,134 @@
+// FILE: app/src/test/java/com/noslop/app/ui/FeedSmoothnessArchitectureTest.kt
+package com.noslop.app.ui
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.io.File
+
+/**
+ * Round 1 of the feed swipe, preloading and background playback work. These rules hold across files
+ * and need a device to fail visibly, so they are checked in the source.
+ */
+class FeedSmoothnessArchitectureTest {
+
+    private val javaRoot: File by lazy {
+        val root = File(".").canonicalFile
+        val dir = File(root, "src/main/java").let { if (it.exists()) it else File(root, "app/src/main/java") }
+        assertTrue("Could not locate src/main/java", dir.exists())
+        dir
+    }
+
+    private fun source(path: String) = File(javaRoot, "com/noslop/app/$path").readText()
+
+    @Test
+    fun aFeedBatchIsComputedWithoutTouchingListState() {
+        // computeFeedBatch runs on a background thread for an append.
+        val vm = source("ui/NoSlopViewModel.kt")
+        val body = vm.substring(vm.indexOf("private fun computeFeedBatch"), vm.indexOf("private fun applyFeedBatch"))
+        assertFalse("publishing belongs in applyFeedBatch", body.contains("_unifiedFeed.value ="))
+        assertFalse("publishing belongs in applyFeedBatch", body.contains("sessionLoadedIds.add"))
+        assertFalse("search paging state is main-thread only", body.contains("fetchNextSearchPage("))
+        assertTrue(vm.contains("withContext(Dispatchers.Default) { computeFeedBatch(actualFilter) }"))
+    }
+
+    @Test
+    fun aListBuiltFromEmptyIsComputedOffTheMainThread() {
+        // NOSLOP_EMPTY_BUILD_OFF_MAIN_V1: only an injection builds on the main thread.
+        val vm = source("ui/NoSlopViewModel.kt")
+        val fn = vm.substring(vm.indexOf("fun loadMoreFeedItems"), vm.indexOf("private fun computeFeedBatch"))
+        assertEquals(2, Regex("""withContext\(Dispatchers\.Default\) \{ computeFeedBatch\(actualFilter\) \}""").findAll(fn).count())
+        assertEquals("one synchronous build, for an injection", 1, Regex("""val plan = computeFeedBatch\(actualFilter\)""").findAll(fn).count())
+        assertTrue(fn.contains("if (isInjection) {"))
+        assertTrue("a second request for the same list waits", fn.contains("if (emptyBuildKey == key) return"))
+        assertTrue("the flag is cleared only by the build that set it", fn.contains("if (emptyBuildKey == key && feedListGeneration == generation) {"))
+    }
+
+    @Test
+    fun theFeedShowsItsLoadingTextWhileAListIsBuilt() {
+        val tab = source("ui/UnifiedFeedTab.kt")
+        val empty = tab.substring(tab.indexOf("if (unifiedItems.isEmpty()) {"))
+        assertTrue("the loading text comes before every empty state", empty.indexOf("if (isBuildingList) {") in 0 until empty.indexOf("Nothing New Here"))
+    }
+
+    @Test
+    fun theFeedListDoesNotRebuildOnEverySwipe() {
+        val tab = source("ui/UnifiedFeedTab.kt")
+        val keys = tab.substring(tab.indexOf("val unifiedItems = remember("), tab.indexOf("if (injectedTutStep == null)"))
+        assertFalse("view history changes on every swipe and the list does not depend on it", keys.contains("viewedHistory"))
+    }
+
+    @Test
+    fun preloadedPlayersAreRetiredNotReleasedOnTheSpot() {
+        val preload = source("ui/PreloadManager.kt")
+        assertEquals(1, Regex("""player\??\.release\(\)""").findAll(preload).count())
+        assertTrue("the one direct release is inside retire()", preload.contains("                player.release()\n"))
+    }
+
+    @Test
+    fun aDeadSlideDoesNotStopTheTorLookahead() {
+        val tab = source("ui/UnifiedFeedTab.kt")
+        assertFalse("waiting for READY left everything behind a dead slide cold", tab.contains("awaitPlayerReady"))
+        assertTrue(tab.contains("warmInOrder("))
+    }
+
+    @Test
+    fun aFinishedStreamIsNotTreatedAsLive() {
+        assertFalse(source("feeds/api/YouTubeInternalClient.kt").contains("isLiveContent"))
+    }
+
+    @Test
+    fun theForegroundNotificationDoesNotDestroyTheRunningActivity() {
+        assertFalse(source("mesh/NoSlopForegroundService.kt").contains("FLAG_ACTIVITY_CLEAR_TASK"))
+    }
+
+    @Test
+    fun aWarmPlayerDoesNotStartItsSoundAheadOfItsPicture() {
+        val video = source("ui/components/VideoPlayer.kt")
+        assertTrue(
+            "the visibility effect used to start a claimed player before its first frame",
+            video.contains("player.playWhenReady = isVisible && !userPaused && !warmStartHeld")
+        )
+        assertFalse(video.contains("player.playWhenReady = isVisible && !userPaused\n"))
+        assertTrue("a warm video gets a fresh player's attributes", source("ui/PreloadManager.kt").contains("AUDIO_CONTENT_TYPE_MOVIE"))
+    }
+
+    @Test
+    fun aFreshListWaitsForItsFirstPageBeforeCountingSwipes() {
+        // NOSLOP_FRESH_LIST_TOP_V1: a filter, list or search arrived on the old list's page, and its jump
+        // to page 0 was read as a swipe back over everything above it.
+        val vm = source("ui/NoSlopViewModel.kt")
+        assertEquals(
+            "filters and searches (applyFeedBatch), History, Saved, Liked (NOSLOP_LIKED_LIST_V1) and an author's posts",
+            5, Regex("""feedPositionRestore\.beginTop\(\)""").findAll(vm).count()
+        )
+        val tab = source("ui/UnifiedFeedTab.kt")
+        assertEquals(
+            "the settle effect and the swipe-past effect both wait",
+            2, Regex("""isRestoringFeedPositionAwayFrom\(settledItemId, pagerState\.settledPage\)""").findAll(tab).count()
+        )
+        assertTrue(tab.contains("viewModel.onFeedPositionRestored(settledItemId, pagerState.settledPage)"))
+        // NOSLOP_FRESH_LIST_TOP_V2: only the top of the list the ViewModel holds ends the wait.
+        assertEquals(2, Regex("""topId = _unifiedFeed\.value\.firstOrNull\(\)\?\.id""").findAll(vm).count())
+    }
+
+    @Test
+    fun aRestoreJumpIsNeverReadAsASwipe() {
+        // NOSLOP_FRESH_LIST_TOP_V2: the target is the last settled slide before the pager jumps to it.
+        val tab = source("ui/UnifiedFeedTab.kt")
+        val jumps = Regex("""lastSettledItemId = target\s+lastSettledListIds = unifiedItems\.map \{ it\.id \}\s+pagerState\.scrollToPage\(index\)""")
+        assertEquals(2, jumps.findAll(tab).count())
+        assertEquals(
+            "no restore records its target after the jump",
+            0, Regex("""scrollToPage\(index\)\s+lastSettledItemId = target""").findAll(tab).count()
+        )
+    }
+
+    @Test
+    fun thePlayerIsKeptMountedThroughTheSwipe() {
+        val video = source("ui/components/VideoPlayer.kt")
+        assertTrue(video.contains("if (keepPlayerMounted) {"))
+        assertEquals(1, Regex("""rememberHeldTrue\(isVisible, PLAYER_UNMOUNT_DELAY_MS, url\)""").findAll(video).count())
+    }
+}

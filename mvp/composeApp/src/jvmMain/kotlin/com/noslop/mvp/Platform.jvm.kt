@@ -1,0 +1,208 @@
+package com.noslop.mvp
+
+import app.cash.sqldelight.db.SqlDriver
+import app.cash.sqldelight.driver.jdbc.sqlite.JdbcSqliteDriver
+import com.noslop.mvp.db.MeshDatabase
+import io.ktor.client.HttpClient
+import io.ktor.client.engine.okhttp.OkHttp
+import java.io.File
+import java.security.KeyFactory
+import java.security.KeyPairGenerator
+import java.security.SecureRandom
+import java.security.Signature
+import java.security.spec.PKCS8EncodedKeySpec
+import java.security.spec.X509EncodedKeySpec
+import javax.crypto.Cipher
+import javax.crypto.KeyAgreement
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
+import kotlin.io.encoding.Base64
+import kotlin.io.encoding.ExperimentalEncodingApi
+import org.bouncycastle.jce.provider.BouncyCastleProvider
+
+/**
+ * JVM (desktop HUB) actuals for the shared platform seams — the same BouncyCastle crypto the Android target
+ * uses (so a HUB verifies signatures and relays DMs identically to a phone), plus plain-file persistence for
+ * identity/handle and a JDBC SQLite database. This is what makes the always-on HUB (ADR-002) a real process.
+ */
+private val bc = BouncyCastleProvider()
+// Per-node storage dir. Override with NOSLOP_HOME so a second JVM node (e.g. the test "creator" leaf) gets a
+// distinct identity + DM key instead of colliding with the hub's (same nodeId would break DM routing).
+private val hubDir = File(System.getenv("NOSLOP_HOME") ?: File(System.getProperty("user.home"), ".noslop-hub").path).apply { mkdirs() }
+
+/** Signs with the JVM identity key read from the identity file (2nd line = PKCS#8 priv, base64). */
+@OptIn(ExperimentalEncodingApi::class)
+actual object IdentitySigner {
+    private val file = File(hubDir, "identity")
+    actual val isAvailable: Boolean get() = file.exists()
+    actual fun sign(message: ByteArray): ByteArray? {
+        val priv = if (file.exists()) file.readLines().getOrNull(1)?.let { Base64.decode(it) } else null
+        return priv?.let { Signer.signRaw(message, it) }?.takeIf { it.isNotEmpty() }
+    }
+}
+
+@OptIn(ExperimentalEncodingApi::class)
+actual object IdentityKeyStore {
+    private val file = File(hubDir, "identity")
+    actual fun loadOrCreatePublicKey(): ByteArray {
+        if (file.exists()) {
+            val lines = file.readLines()
+            if (lines.isNotEmpty()) return Base64.decode(lines[0])
+        }
+        val kp = KeyPairGenerator.getInstance("Ed25519", bc)
+            .apply { initialize(255, SecureRandom()) }.generateKeyPair()
+        val x25519Kp = KeyPairGenerator.getInstance("X25519", bc)
+            .apply { initialize(255, SecureRandom()) }.generateKeyPair()
+            
+        file.writeText(
+            Base64.encode(kp.public.encoded) + "\n" + 
+            Base64.encode(kp.private.encoded) + "\n" +
+            Base64.encode(x25519Kp.public.encoded) + "\n" +
+            Base64.encode(x25519Kp.private.encoded) + "\n"
+        )
+        return kp.public.encoded
+    }
+    
+    actual fun getPrivateKey(): ByteArray? {
+        if (!file.exists()) return null
+        val lines = file.readLines()
+        return if (lines.size > 1) Base64.decode(lines[1]) else null
+    }
+
+    actual fun getEncPublicKey(): ByteArray? {
+        if (!file.exists()) return null
+        val lines = file.readLines()
+        return if (lines.size > 2) Base64.decode(lines[2]) else null
+    }
+
+    actual fun getEncPrivateKey(): ByteArray? {
+        if (!file.exists()) return null
+        val lines = file.readLines()
+        return if (lines.size > 3) Base64.decode(lines[3]) else null
+    }
+
+    actual val isRealKeypair: Boolean get() = true
+    actual fun reset() { file.delete() }
+}
+
+actual object HandleStore {
+    private val file = File(hubDir, "handle")
+    actual fun load(): String = if (file.exists()) file.readText().trim().ifBlank { "hub" } else "hub"
+    actual fun save(handle: String) { file.writeText(handle) }
+}
+
+/** Saved-hubs blob in a file under the hub dir (same approach as [HandleStore]). */
+actual object HubStore {
+    private val file = File(hubDir, "hubs")
+    actual fun load(): String? = if (file.exists()) file.readText().ifBlank { null } else null
+    actual fun save(blob: String) { file.writeText(blob) }
+    actual fun clear() { file.delete() }
+}
+
+/** X25519 DM private key in a file under the hub dir (per-leaf; the creator-leaf reuses this). */
+actual object DmKeyStore {
+    private val file = File(hubDir, "dm_priv")
+    actual fun load(): String? = if (file.exists()) file.readText().trim().ifBlank { null } else null
+    actual fun save(privRawB64: String) { file.writeText(privRawB64) }
+}
+
+/** Feed-filter text blob in a file under the hub dir. */
+actual object FilterStore {
+    private val file = File(hubDir, "filters")
+    actual fun load(): String? = if (file.exists()) file.readText().ifBlank { null } else null
+    actual fun save(blob: String) { file.writeText(blob) }
+}
+
+/** Saved-DM-contacts blob in a file under the hub dir (same approach as [HubStore]). */
+actual object ContactStore {
+    private val file = File(hubDir, "contacts")
+    actual fun load(): String? = if (file.exists()) file.readText().ifBlank { null } else null
+    actual fun save(blob: String) { file.writeText(blob) }
+    actual fun clear() { file.delete() }
+}
+
+/** JVM Ed25519 signer via BouncyCastle JCA (raw bytes; base64/UTF-8 stay in commonMain). Mirrors androidMain. */
+actual object Signer {
+    actual val isAvailable: Boolean = true
+
+    actual fun signRaw(payload: ByteArray, pkcs8PrivateKey: ByteArray): ByteArray = try {
+        val priv = KeyFactory.getInstance("Ed25519", bc).generatePrivate(PKCS8EncodedKeySpec(pkcs8PrivateKey))
+        Signature.getInstance("Ed25519", bc).run { initSign(priv); update(payload); sign() }
+    } catch (e: Exception) { ByteArray(0) }
+
+    actual fun verifyRaw(payload: ByteArray, signature: ByteArray, x509PublicKey: ByteArray): Boolean = try {
+        val pub = KeyFactory.getInstance("Ed25519", bc).generatePublic(X509EncodedKeySpec(x509PublicKey))
+        Signature.getInstance("Ed25519", bc).run { initVerify(pub); update(payload); verify(signature) }
+    } catch (e: Exception) { false }
+}
+
+/** JVM DM crypto via BouncyCastle: X25519 + ChaCha20-Poly1305 (IETF). Mirrors androidMain. */
+actual object DmCrypto {
+    actual val isAvailable: Boolean = true
+
+    actual fun x25519SharedSecret(myPrivPkcs8: ByteArray, theirPubX509: ByteArray): ByteArray = try {
+        val kf = KeyFactory.getInstance("X25519", bc)
+        val priv = kf.generatePrivate(PKCS8EncodedKeySpec(myPrivPkcs8))
+        val pub = kf.generatePublic(X509EncodedKeySpec(theirPubX509))
+        KeyAgreement.getInstance("X25519", bc).run { init(priv); doPhase(pub, true); generateSecret() }
+    } catch (e: Exception) { ByteArray(0) }
+
+    actual fun chachaSeal(key: ByteArray, nonce: ByteArray, plaintext: ByteArray, aad: ByteArray): ByteArray = try {
+        cipher(Cipher.ENCRYPT_MODE, key, nonce).apply { if (aad.isNotEmpty()) updateAAD(aad) }.doFinal(plaintext)
+    } catch (e: Exception) { ByteArray(0) }
+
+    actual fun chachaOpen(key: ByteArray, nonce: ByteArray, ciphertextAndTag: ByteArray, aad: ByteArray): ByteArray? = try {
+        cipher(Cipher.DECRYPT_MODE, key, nonce).apply { if (aad.isNotEmpty()) updateAAD(aad) }.doFinal(ciphertextAndTag)
+    } catch (e: Exception) { null }
+
+    actual fun randomBytes(n: Int): ByteArray = ByteArray(n).also { SecureRandom().nextBytes(it) }
+
+    private fun cipher(mode: Int, key: ByteArray, nonce: ByteArray): Cipher =
+        Cipher.getInstance("ChaCha20-Poly1305", bc).apply {
+            init(mode, SecretKeySpec(key, "ChaCha20"), IvParameterSpec(nonce))
+        }
+}
+
+/** JVM SQLite via the JDBC driver; creates the schema on first run. */
+actual object DbDriverFactory {
+    actual val isAvailable: Boolean = true
+    actual fun create(): SqlDriver {
+        val dbFile = File(hubDir, "mesh.db")
+        val fresh = !dbFile.exists()
+        val driver = JdbcSqliteDriver("jdbc:sqlite:${dbFile.absolutePath}")
+        if (fresh) MeshDatabase.Schema.create(driver)
+        return driver
+    }
+}
+
+// Client-level timeouts (punch-list M4) — a hostile/hung server must not pin a fetch forever.
+actual fun httpClientEngineFactory(): HttpClient = HttpClient(OkHttp) {
+    install(io.ktor.client.plugins.HttpTimeout) {
+        requestTimeoutMillis = 30_000
+        connectTimeoutMillis = 15_000
+    }
+}
+
+actual fun nowMillis(): Long = System.currentTimeMillis()
+actual fun randomId(): String = java.util.UUID.randomUUID().toString()
+
+/** The desktop HUB hosts the onion (via TorProcess) rather than dialing one — no client Tor needed here. */
+actual object TorService {
+    actual val isAvailable: Boolean = false
+    actual fun start() {}
+    actual fun socksPort(): Int = 0
+    actual fun bootstrapProgress(): Int = 0
+    actual fun status(): String = "unavailable"
+}
+
+/** The desktop HUB *shows* the QR; it doesn't scan one. */
+actual object QrScanner {
+    actual val isAvailable: Boolean = false
+    actual fun scan(onResult: (String?) -> Unit) { onResult(null) }
+}
+
+/** No video playback on the desktop HUB (headless). */
+actual object VideoPlayer {
+    actual val isAvailable: Boolean = false
+    actual fun play(url: String) {}
+}

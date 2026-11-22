@@ -1,0 +1,323 @@
+package com.noslop.app.ui.components
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.noslop.app.debug.Logger
+import com.noslop.app.ui.theme.*
+import com.noslop.app.ui.PreloadManager
+
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+@Composable
+fun AudioPlayer(
+    url: String,
+    isVisible: Boolean = true,
+    stableKey: String? = null,
+    // Called each time playback actually starts, like VideoPlayer's onPlaybackStarted; mesh audio posts
+    // use it to count as seen.
+    onPlaybackStarted: (() -> Unit)? = null
+) {
+    val actualKey = stableKey ?: url
+    val currentOnPlaybackStarted by rememberUpdatedState(onPlaybackStarted)
+    val context = LocalContext.current
+    var isPlaying by remember { mutableStateOf(false) }
+    // --- NOSLOP_MEDIA_PEERS_V1 ---
+    // STATE_BUFFERING was logged but never surfaced, so a track that was still
+    // loading looked identical to one sitting paused.
+    var isBuffering by remember(url) { mutableStateOf(true) }
+    var progress by remember { mutableStateOf(0f) }
+    var duration by remember { mutableStateOf(0L) }
+    var currentPos by remember { mutableStateOf(0L) }
+
+    var exoPlayer by remember { mutableStateOf<androidx.media3.exoplayer.ExoPlayer?>(null) }
+    var hasError by remember { mutableStateOf(false) }
+
+    // --- NOSLOP_SMOOTH_TEARDOWN_V1 --- see PlaybackPolicy.kt
+    val keepPlayer = rememberHeldTrue(isVisible, PLAYER_UNMOUNT_DELAY_MS, url)
+
+    DisposableEffect(url, keepPlayer) {
+        if (keepPlayer) {
+            hasError = false
+            
+            val preloaded = PreloadManager.claim(actualKey, url) ?: PreloadManager.claim(url, url)
+            val player = if (preloaded != null) {
+                preloaded.apply {
+                    playWhenReady = true
+                    val resumeMs = PlaybackPositionStore.resumePositionFor(actualKey)
+                    // Ignore micro-seeks under 8s to prevent destroying preloaded audio buffer over Tor
+                    if (resumeMs >= 8000L && Math.abs(currentPosition - resumeMs) > 3000L) {
+                        Logger.info("AUDIO", "Resuming preloaded audio at ${resumeMs}ms: $url")
+                        seekTo(resumeMs)
+                    }
+                    addListener(object : androidx.media3.common.Player.Listener {
+                        override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                            hasError = true
+                            Logger.error("AUDIO", "ExoPlayer (Preload) error: ${error.message} | Code: ${error.errorCode} | URL: $url", error.stackTraceToString())
+                        }
+                        override fun onIsPlayingChanged(playing: Boolean) {
+                            Logger.info("AUDIO", "ExoPlayer isPlayingChanged: $playing for $url")
+                            isPlaying = playing
+                            // --- NOSLOP_AUDIO_SPINNER_V1 --- audio is audibly flowing; never show a spinner
+                            if (playing) isBuffering = false
+                            if (playing) currentOnPlaybackStarted?.invoke()
+                        }
+                        override fun onPlaybackStateChanged(state: Int) {
+                            val stateStr = when(state) {
+                                androidx.media3.common.Player.STATE_READY -> "READY"
+                                androidx.media3.common.Player.STATE_BUFFERING -> "BUFFERING"
+                                androidx.media3.common.Player.STATE_ENDED -> "ENDED"
+                                androidx.media3.common.Player.STATE_IDLE -> "IDLE"
+                                else -> "UNKNOWN"
+                            }
+                            Logger.info("AUDIO", "ExoPlayer state changed: $stateStr for $url")
+                            // --- NOSLOP_AUDIO_SPINNER_V1 --- the preloaded branch was missed first time round
+                            isBuffering = state == androidx.media3.common.Player.STATE_BUFFERING
+                            if (state == androidx.media3.common.Player.STATE_READY) {
+                                duration = this@apply.duration
+                            }
+                        }
+                    })
+                    // Ensure duration is caught if already ready
+                    if (playbackState == androidx.media3.common.Player.STATE_READY) {
+                        duration = this.duration
+                    }
+                }
+            } else {
+                val dataSourceFactory = androidx.media3.datasource.okhttp.OkHttpDataSource.Factory(com.noslop.app.net.HttpClientProvider.activeClearnetClient)
+                
+                val audioAttributes = androidx.media3.common.AudioAttributes.Builder()
+                    .setUsage(androidx.media3.common.C.USAGE_MEDIA)
+                    .setContentType(androidx.media3.common.C.AUDIO_CONTENT_TYPE_MUSIC)
+                    .build()
+                    
+                val loadControl = androidx.media3.exoplayer.DefaultLoadControl.Builder()
+                    .setBufferDurationsMs(
+                        10000, // min buffer (10s)
+                        30000, // max buffer (30s)
+                        500,   // buffer for playback (0.5s)
+                        4000   // buffer for playback after rebuffer (4s)
+                    )
+                    .setPrioritizeTimeOverSizeThresholds(true)
+                    .build()
+
+                androidx.media3.exoplayer.ExoPlayer.Builder(context)
+                    .setMediaSourceFactory(androidx.media3.exoplayer.source.DefaultMediaSourceFactory(dataSourceFactory))
+                    .setLoadControl(loadControl)
+                    .setAudioAttributes(audioAttributes, true)
+                    .build().apply {
+                        // NOSLOP_MEDIA_ENCRYPTION_V1: an encrypted local file plays through the local media server.
+                        val mediaItem = androidx.media3.common.MediaItem.fromUri(com.noslop.app.ui.playableMediaUrl(url))
+                        setMediaItem(mediaItem)
+                        volume = 1f
+                        val resumeMs = PlaybackPositionStore.resumePositionFor(actualKey)
+                        if (resumeMs >= 8000L) {
+                            Logger.info("AUDIO", "Resuming audio at ${resumeMs}ms: $url")
+                            seekTo(resumeMs)
+                        }
+                        prepare()
+                        playWhenReady = true
+                        repeatMode = androidx.media3.common.Player.REPEAT_MODE_ONE
+                        
+                        addListener(object : androidx.media3.common.Player.Listener {
+                            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                                hasError = true
+                                Logger.error("AUDIO", "ExoPlayer (Direct) error: ${error.message} | Code: ${error.errorCode} | URL: $url", error.stackTraceToString())
+                            }
+                            override fun onIsPlayingChanged(playing: Boolean) {
+                                Logger.info("AUDIO", "ExoPlayer isPlayingChanged: $playing for $url")
+                                isPlaying = playing
+                                // --- NOSLOP_AUDIO_SPINNER_V1 --- audio is audibly flowing; never show a spinner
+                                if (playing) isBuffering = false
+                                if (playing) currentOnPlaybackStarted?.invoke()
+                            }
+                            override fun onPlaybackStateChanged(state: Int) {
+                                val stateStr = when(state) {
+                                    androidx.media3.common.Player.STATE_READY -> "READY"
+                                    androidx.media3.common.Player.STATE_BUFFERING -> "BUFFERING"
+                                    androidx.media3.common.Player.STATE_ENDED -> "ENDED"
+                                    androidx.media3.common.Player.STATE_IDLE -> "IDLE"
+                                    else -> "UNKNOWN"
+                                }
+                                Logger.info("AUDIO", "ExoPlayer state changed: $stateStr for $url")
+                                isBuffering = state == androidx.media3.common.Player.STATE_BUFFERING
+                                if (state == androidx.media3.common.Player.STATE_READY) {
+                                    duration = this@apply.duration
+                                }
+                            }
+                        })
+                    }
+            }
+                
+            exoPlayer = player
+            isPlaying = player.isPlaying
+            // --- NOSLOP_AUDIO_SPINNER_V1 ---
+            // The decisive fix. A claimed preloaded player has usually reached
+            // STATE_READY while still sitting in the preload cache, before the
+            // UI attaches its listener. onPlaybackStateChanged only fires on a
+            // CHANGE, so no callback ever arrives and the listener alone can
+            // never clear the initial `true`. Seed from the real state instead.
+            isBuffering = player.playbackState == androidx.media3.common.Player.STATE_BUFFERING
+            if (player.playbackState == androidx.media3.common.Player.STATE_READY) {
+                duration = player.duration
+            }
+            currentPos = player.currentPosition
+            if (duration > 0) {
+                progress = currentPos.toFloat() / duration
+            }
+            
+            onDispose {
+                try {
+                    val pos = player.currentPosition
+                    if (pos >= 8000L) {
+                        PlaybackPositionStore.save(actualKey, pos, player.duration)
+                    }
+                } catch (e: Exception) {
+                    Logger.warn("AUDIO", "Failed to save playback position for $url: ${e.message}")
+                }
+                player.release()
+                exoPlayer = null
+                isPlaying = false
+            }
+        } else {
+            onDispose { }
+        }
+    }
+
+    LaunchedEffect(isVisible, exoPlayer) {
+        exoPlayer?.let { player ->
+            if (isVisible && player.playbackState == androidx.media3.common.Player.STATE_IDLE && player.playerError == null) {
+                player.prepare() // swiped back after the stop below
+            }
+            player.playWhenReady = isVisible
+            if (isVisible) {
+                player.play()
+            } else {
+                player.pause()
+                kotlinx.coroutines.delay(PLAYER_STOP_DELAY_MS)
+                player.stop()
+            }
+        }
+    }
+
+    LaunchedEffect(isPlaying, exoPlayer) {
+        exoPlayer?.let { player ->
+            var ticksSinceSave = 0
+            while (isPlaying) {
+                currentPos = player.currentPosition
+                val d = player.duration
+                if (d > 0) {
+                    progress = currentPos.toFloat() / d
+                    duration = d
+                }
+                // Piggyback a position save on this existing 200ms poll loop,
+                // throttled to roughly every 5s so we're not writing on every tick.
+                ticksSinceSave++
+                if (ticksSinceSave >= 25) {
+                    ticksSinceSave = 0
+                    try {
+                        PlaybackPositionStore.save(actualKey, currentPos, duration)
+                    } catch (e: Exception) { /* player may be mid-release; ignore */ }
+                }
+                kotlinx.coroutines.delay(200)
+            }
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        // --- NOSLOP_MEDIA_PEERS_V1 ---
+        // Progress ring around the play button while the track buffers.
+        Box(contentAlignment = Alignment.Center) {
+            if (isBuffering && !hasError) {
+                CircularProgressIndicator(
+                    color = AccentGreen,
+                    modifier = Modifier.size(96.dp),
+                    strokeWidth = 3.dp
+                )
+            }
+            IconButton(
+                onClick = { exoPlayer?.let { if (isPlaying) it.pause() else it.play() } },
+                modifier = Modifier.size(80.dp).background(AccentGreen, CircleShape)
+            ) {
+                Icon(
+                    imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                    contentDescription = null,
+                    tint = PrimaryBlack,
+                    modifier = Modifier.size(48.dp)
+                )
+            }
+        }
+        
+        Spacer(modifier = Modifier.height(32.dp))
+
+        // Waveform preview (animated when playing)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(120.dp)
+                .padding(horizontal = 16.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            val waveBars = 40
+            for (i in 0 until waveBars) {
+                val heightPercent = remember(i, isPlaying) { 
+                    if (isPlaying) (20..95).random() / 100f 
+                    else (30..40).random() / 100f 
+                }
+                val isPlayed = progress > (i.toFloat() / waveBars)
+                Box(
+                    modifier = Modifier
+                        .width(4.dp)
+                        .fillMaxHeight(heightPercent)
+                        .clip(RoundedCornerShape(2.dp))
+                        .background(if (isPlayed) AccentGreen else BorderSubtle.copy(alpha = 0.5f))
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // Draggable Timeline
+        Slider(
+            value = progress,
+            onValueChange = { 
+                progress = it
+                exoPlayer?.seekTo((it * duration).toLong())
+            },
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            colors = SliderDefaults.colors(
+                thumbColor = AccentGreen,
+                activeTrackColor = AccentGreen,
+                inactiveTrackColor = BorderSubtle
+            )
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            val currentStr = String.format("%02d:%02d", (currentPos/1000)/60, (currentPos/1000)%60)
+            val durationStr = String.format("%02d:%02d", (duration/1000)/60, (duration/1000)%60)
+            Text(currentStr, color = TextMuted, fontSize = 12.sp)
+            Text(durationStr, color = TextMuted, fontSize = 12.sp)
+        }
+    }
+}

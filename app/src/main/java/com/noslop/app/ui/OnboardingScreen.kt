@@ -1,0 +1,1285 @@
+// FILE: app/src/main/java/com/noslop/app/ui/OnboardingScreen.kt
+package com.noslop.app.ui
+
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.widget.Toast
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.noslop.app.crypto.CryptoService
+import com.noslop.app.feeds.BuiltInSource
+import com.noslop.app.feeds.SourceLibrary
+import com.noslop.app.ui.theme.*
+import com.noslop.app.util.tr
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+
+@Composable
+fun OnboardingScreen(
+    viewModel: NoSlopViewModel,
+    onComplete: () -> Unit
+) {
+    var currentStep by remember { mutableStateOf(1) }
+    var handleText by remember { mutableStateOf("") }
+    val selectedInterests = remember { mutableStateListOf<String>() }
+    val selectedMusicGenres = remember { mutableStateListOf<String>() }
+    val selectedVideoGenres = remember { mutableStateListOf<String>() }
+    val selectedSources = remember { mutableStateListOf<BuiltInSource>() }
+    var creatorKeywordsText by remember { mutableStateOf("") }
+    
+    val mnemonic by viewModel.mnemonic.collectAsState()
+    val localKeys by viewModel.localKeys.collectAsState()
+    val isUsingInsecureStorage by viewModel.isUsingInsecureStorage.collectAsState()
+    val appLanguage by viewModel.appLanguage.collectAsState()
+    val context = LocalContext.current
+
+    Scaffold(
+        modifier = Modifier.fillMaxSize().testTag("onboarding_scaffold"),
+        containerColor = PrimaryBlack
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.SpaceBetween
+        ) {
+            // Top Section: App logo & Step Indicator
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                
+            if (isUsingInsecureStorage) {
+                Card(
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+                    colors = CardDefaults.cardColors(containerColor = DestructiveRed.copy(alpha = 0.2f)),
+                    border = BorderStroke(1.dp, DestructiveRed)
+                ) {
+                    Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Security, contentDescription = null, tint = DestructiveRed)
+                        Spacer(modifier = Modifier.width(16.dp))
+                        Column {
+                            Text("Security Warning".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                            Text("Hardware-backed encryption is unavailable on this device. Your identity keys will be stored in plaintext. Proceed at your own risk.".tr, style = MaterialTheme.typography.bodySmall, color = TextLight)
+                        }
+                    }
+                }
+            }
+
+                Text(
+                    text = "NO_SLOP".tr,
+                    style = MaterialTheme.typography.headlineLarge.copy(
+                        color = AccentGreen,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace,
+                        letterSpacing = 4.sp
+                    ),
+                    modifier = Modifier.padding(top = 16.dp)
+                )
+
+                Text(
+                    text = "SERVERLESS HAI-NET NODE".tr,
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        color = TextMuted,
+                        letterSpacing = 2.sp
+                    ),
+                    modifier = Modifier.padding(top = 4.dp, bottom = 24.dp)
+                )
+
+                // 9-dot step indicators
+                Row(
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    repeat(8) { index ->
+                        Box(
+                            modifier = Modifier
+                                .padding(horizontal = 4.dp)
+                                .size(if (currentStep == index + 1) 12.dp else 8.dp)
+                                .clip(RoundedCornerShape(50))
+                                .background(if (currentStep == index + 1) AccentGreen else TextMuted)
+                        )
+                    }
+                }
+            }
+
+            // Middle Content Section
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(vertical = 24.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                when (currentStep) {
+                    1 -> Step1Welcome(viewModel = viewModel, onComplete = onComplete)
+                    2 -> Step2Language(
+                        currentLanguage = appLanguage,
+                        onLanguageSelect = { code -> viewModel.updateAppLanguage(code) }
+                    )
+                    3 -> Step3Identity(
+                        handle = handleText,
+                        onHandleChange = { handleText = it },
+                        mnemonic = mnemonic,
+                        onGenerateMnemonic = { viewModel.generateMnemonic() },
+                        onCopyMnemonic = {
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            val clip = ClipData.newPlainText(com.noslop.app.util.LanguageManager.translate("NoSlop Mnemonic"), it)
+                            clipboard.setPrimaryClip(clip)
+                            Toast.makeText(context, com.noslop.app.util.LanguageManager.translate("Mnemonic copied to clipboard"), Toast.LENGTH_SHORT).show()
+                        }
+                    )
+                    4 -> Step4Interests(
+                        selectedInterests = selectedInterests,
+                        onToggleInterest = { interest ->
+                            if (selectedInterests.contains(interest)) selectedInterests.remove(interest)
+                            else selectedInterests.add(interest)
+                        }
+                    )
+                    5 -> Step5Creators(
+                        selectedInterests = selectedInterests,
+                        creatorKeywords = creatorKeywordsText,
+                        onCreatorKeywordsChange = { creatorKeywordsText = it }
+                    )
+                    6 -> Step6Genres(
+                        interests = selectedInterests,
+                        selectedMusicGenres = selectedMusicGenres,
+                        selectedVideoGenres = selectedVideoGenres,
+                        onToggleMusicGenre = { genre ->
+                            if (selectedMusicGenres.contains(genre)) selectedMusicGenres.remove(genre)
+                            else selectedMusicGenres.add(genre)
+                        },
+                        onToggleVideoGenre = { genre ->
+                            if (selectedVideoGenres.contains(genre)) selectedVideoGenres.remove(genre)
+                            else selectedVideoGenres.add(genre)
+                        }
+                    )
+                    7 -> Step7Feeds(
+                        interests = selectedInterests,
+                        selectedSources = selectedSources,
+                        onToggleSource = { src ->
+                            if (selectedSources.contains(src)) selectedSources.remove(src)
+                            else selectedSources.add(src)
+                        }
+                    )
+                    8 -> Step8FeedMix(
+                        viewModel = viewModel
+                    )
+                }
+            }
+
+            // Bottom Navigation Buttons
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (currentStep > 1 && currentStep <= 8) {
+                    Button(
+                        onClick = { currentStep-- },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = SurfaceDark,
+                            contentColor = TextLight
+                        ),
+                        border = BorderStroke(1.dp, BorderSubtle),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier
+                            .height(50.dp)
+                            .testTag("onboarding_back_button")
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back".tr)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Back".tr, fontWeight = FontWeight.Bold)
+                    }
+                } else {
+                    Spacer(modifier = Modifier.width(1.dp))
+                }
+
+                val canProceed = when (currentStep) {
+                    1 -> true
+                    2 -> true
+                    3 -> handleText.isNotBlank() && mnemonic != null
+                    4 -> selectedInterests.isNotEmpty()
+                    5 -> true
+                    6 -> true
+                    7 -> selectedSources.isNotEmpty()
+                    8 -> true
+                    else -> false
+                }
+
+                if (currentStep <= 8) {
+                    Button(
+                        onClick = {
+                            if (currentStep == 5 && creatorKeywordsText.isNotBlank()) {
+                                viewModel.triggerBackgroundCreatorPreFetch(creatorKeywordsText)
+                            }
+                            if (currentStep == 8) {
+                                viewModel.completeOnboarding(
+                                    handleText, 
+                                    selectedSources, 
+                                    selectedInterests, 
+                                    selectedMusicGenres,
+                                    selectedVideoGenres,
+                                    mnemonic!!,
+                                    creatorKeywordsText
+                                )
+                                onComplete()
+                            } else {
+                                currentStep++
+                            }
+                        },
+                        enabled = canProceed,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = AccentGreen,
+                            contentColor = PrimaryBlack,
+                            disabledContainerColor = SurfaceDark,
+                            disabledContentColor = TextMuted
+                        ),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier
+                            .height(50.dp)
+                            .testTag("onboarding_next_button")
+                    ) {
+                        Text(if (currentStep == 8) "Finish".tr else "Continue".tr,
+                            fontWeight = FontWeight.Bold,
+                            color = if (canProceed) PrimaryBlack else TextMuted
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Icon(if (currentStep == 8) Icons.Default.Check else Icons.AutoMirrored.Filled.ArrowForward, contentDescription = "Next".tr)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun Step1Welcome(viewModel: NoSlopViewModel, onComplete: () -> Unit) {
+    val needsRecovery by viewModel.needsIdentityRecovery.collectAsState()
+    LaunchedEffect(Unit) {
+        viewModel.checkIdentityRecoveryState()
+    }
+    val context = LocalContext.current
+    var showRestoreDialog by remember { mutableStateOf(false) }
+    var mnemonicInput by remember { mutableStateOf("") }
+    var isRestoring by remember { mutableStateOf(false) }
+    var restoreError by remember { mutableStateOf<String?>(null) }
+    // R5: an unauthenticated (older) archive needs the user's confirmation, as in Settings. Onboarding
+    // passed no handler, so such a restore spun forever.
+    var pendingLegacyUri by remember { mutableStateOf<android.net.Uri?>(null) }
+
+    fun startRestore(uri: android.net.Uri, allowLegacy: Boolean) {
+        // R5: the Word Cloud as typed; BackupManager tries its canonical and as-typed forms.
+        viewModel.importBackupFromUri(
+            context,
+            mnemonicInput,
+            uri,
+            allowLegacyUnauthenticated = allowLegacy,
+            onLegacyDetected = {
+                isRestoring = false
+                pendingLegacyUri = uri
+            },
+            onFailed = { reason ->
+                restoreError = com.noslop.app.util.LanguageManager.translate("Restore failed: {reason}").replace("{reason}", reason)
+            }
+        ) { success ->
+            if (!success) {
+                isRestoring = false
+                if (restoreError == null) {
+                    restoreError = com.noslop.app.util.LanguageManager.translate("Failed to decrypt or import backup. Check your mnemonic.")
+                }
+            } else {
+                // importBackupFromUri restarts the process automatically on success.
+            }
+        }
+    }
+    
+    val filePickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            startRestore(uri, allowLegacy = false)
+        } else {
+            isRestoring = false
+        }
+    }
+
+    val welcomeSlides = remember {
+        listOf(
+            Triple(
+                Icons.Default.Security,
+                "Welcome to NoSlop",
+                "No accounts, no email, no central servers. Your keys, database and media stay encrypted on this device."
+            ),
+            Triple(
+                Icons.Default.Hub,
+                "Peer-to-Peer Over Tor",
+                "End-to-end encrypted direct messages, group chats and friends-only sharing directly between phones."
+            ),
+            Triple(
+                Icons.Default.Tune,
+                "Your Feed, Zero Algorithms",
+                "Follow creators on the mesh and read the open web through a tracker-free aggregator you control."
+            )
+        )
+    }
+    val welcomePagerState = rememberPagerState(pageCount = { welcomeSlides.size })
+    val pulse by rememberInfiniteTransition(label = "welcomePulse").animateFloat(
+        initialValue = 0.94f,
+        targetValue = 1.06f,
+        animationSpec = infiniteRepeatable(tween(1400, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+        label = "welcomePulseScale"
+    )
+
+    Column(
+        modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        if (needsRecovery) {
+            Card(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                colors = CardDefaults.cardColors(containerColor = DestructiveRed.copy(alpha = 0.2f)),
+                border = BorderStroke(1.dp, DestructiveRed)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Warning, contentDescription = null, tint = DestructiveRed)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Identity Recovery Required".tr, fontWeight = FontWeight.Bold, color = TextLight)
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        "An unreadable or quarantined identity was detected. Restore your existing account from a backup or Word Cloud, or start fresh.".tr,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextLight
+                    )
+                }
+            }
+        }
+
+        HorizontalPager(
+            state = welcomePagerState,
+            modifier = Modifier.fillMaxWidth()
+        ) { page ->
+            val (icon, title, body) = welcomeSlides[page]
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp),
+                colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+                border = BorderStroke(1.dp, BorderSubtle),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 28.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size((76 * pulse).dp)
+                            .clip(RoundedCornerShape(50))
+                            .background(AccentGreen.copy(alpha = 0.14f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = icon,
+                            contentDescription = null,
+                            tint = AccentGreen,
+                            modifier = Modifier.size(40.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(20.dp))
+                    Text(
+                        text = title.tr,
+                        style = MaterialTheme.typography.headlineSmall,
+                        color = TextLight,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(
+                        text = body.tr,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = TextMuted,
+                        textAlign = TextAlign.Center,
+                        lineHeight = 22.sp
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(14.dp))
+        Row(
+            horizontalArrangement = Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            repeat(welcomeSlides.size) { index ->
+                val active = welcomePagerState.currentPage == index
+                Box(
+                    modifier = Modifier
+                        .padding(horizontal = 4.dp)
+                        .size(width = if (active) 20.dp else 8.dp, height = 8.dp)
+                        .clip(RoundedCornerShape(50))
+                        .background(if (active) AccentGreen else TextMuted.copy(alpha = 0.5f))
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+        
+        OutlinedButton(
+            onClick = { showRestoreDialog = true },
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 32.dp).height(50.dp),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = AccentGreen),
+            border = BorderStroke(1.dp, AccentGreen)
+        ) {
+            Icon(Icons.Default.SettingsBackupRestore, contentDescription = null, modifier = Modifier.size(20.dp))
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Restore from Backup Archive".tr, fontWeight = FontWeight.Bold)
+        }
+        
+        pendingLegacyUri?.let { legacyUri ->
+            AlertDialog(
+                onDismissRequest = { pendingLegacyUri = null },
+                containerColor = SurfaceDark,
+                title = { Text("Older Backup Format".tr, color = TextLight, fontWeight = FontWeight.Bold) },
+                text = {
+                    Text(
+                        "This backup was made by an older NoSlop version and is not tamper-protected. Only continue if you made this file yourself and it has not left your control.".tr,
+                        color = TextMuted,
+                        fontSize = 14.sp
+                    )
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            pendingLegacyUri = null
+                            isRestoring = true
+                            restoreError = null
+                            startRestore(legacyUri, allowLegacy = true)
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = PrimaryBlack)
+                    ) {
+                        Text("Proceed with Import".tr, fontWeight = FontWeight.Bold)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { pendingLegacyUri = null }) {
+                        Text("Cancel".tr, color = TextMuted)
+                    }
+                }
+            )
+        }
+
+        if (showRestoreDialog) {
+            AlertDialog(
+                onDismissRequest = { if (!isRestoring) showRestoreDialog = false },
+                containerColor = SurfaceDark,
+                title = { Text("Restore Profile Backup".tr, color = TextLight, fontWeight = FontWeight.Bold) },
+                text = {
+                    Column {
+                        Text("Enter the 12-word 'Word Cloud' password used when creating this backup file. The app will restart upon success.".tr, color = TextMuted, fontSize = 14.sp)
+                        Spacer(modifier = Modifier.height(16.dp))
+                        OutlinedTextField(
+                            value = mnemonicInput,
+                            onValueChange = { mnemonicInput = it },
+                            label = { Text("Mnemonic Word Cloud".tr) },
+                            modifier = Modifier.fillMaxWidth().height(120.dp),
+                            colors = OutlinedTextFieldDefaults.colors(focusedTextColor = TextLight, unfocusedTextColor = TextLight)
+                        )
+                        if (restoreError != null) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(restoreError!!, color = DestructiveRed, fontSize = 12.sp)
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            isRestoring = true
+                            restoreError = null
+                            filePickerLauncher.launch(arrayOf("application/zip", "application/octet-stream"))
+                        },
+                        enabled = !isRestoring && mnemonicInput.isNotBlank(),
+                        colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = PrimaryBlack)
+                    ) {
+                        if (isRestoring) CircularProgressIndicator(modifier = Modifier.size(16.dp), color = PrimaryBlack)
+                        else Text("Select Backup File".tr, fontWeight = FontWeight.Bold)
+                    }
+                },
+                dismissButton = {
+                    if (!isRestoring) {
+                        TextButton(onClick = { showRestoreDialog = false }) {
+                            Text("Cancel".tr, color = TextMuted)
+                        }
+                    }
+                }
+            )
+        }
+
+
+    }
+}
+
+@Composable
+fun Step2Language(
+    currentLanguage: String,
+    onLanguageSelect: (String) -> Unit
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = "App Language".tr,
+            style = MaterialTheme.typography.titleLarge,
+            color = TextLight,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(bottom = 8.dp)
+        )
+        Text(
+            text = "Change the interface language.".tr,
+            style = MaterialTheme.typography.bodyMedium,
+            color = TextMuted,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 24.dp)
+        )
+
+        val languages = com.noslop.app.util.LanguageManager.supportedLanguages
+        
+        LazyColumn(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)
+        ) {
+            items(languages) { (code, name) ->
+                val isSelected = currentLanguage == code
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp)
+                        .clickable { onLanguageSelect(code) },
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (isSelected) SurfaceDark else PrimaryBlack
+                    ),
+                    border = BorderStroke(1.dp, if (isSelected) AccentGreen else BorderSubtle),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(16.dp).fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(name, color = if (isSelected) AccentGreen else TextLight, fontWeight = FontWeight.Bold)
+                        if (isSelected) {
+                            Icon(Icons.Default.Check, contentDescription = null, tint = AccentGreen)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun Step3Identity(
+    handle: String,
+    onHandleChange: (String) -> Unit,
+    mnemonic: String?,
+    onGenerateMnemonic: () -> Unit,
+    onCopyMnemonic: (String) -> Unit
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = "Your Identity Card".tr,
+            style = MaterialTheme.typography.titleLarge,
+            color = TextLight,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(bottom = 8.dp)
+        )
+
+        Text(
+            text = "Choose a handle and generate your 'Word Cloud' password.".tr,
+            style = MaterialTheme.typography.bodyMedium,
+            color = TextMuted,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 24.dp)
+        )
+
+        OutlinedTextField(
+            value = handle,
+            onValueChange = { if (it.length <= 20) onHandleChange(it) },
+            label = { Text("Handle (e.g., satoshi)".tr) },
+            singleLine = true,
+            shape = RoundedCornerShape(8.dp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = AccentGreen,
+                unfocusedBorderColor = BorderSubtle,
+                focusedTextColor = TextLight,
+                unfocusedTextColor = TextLight
+            ),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        if (mnemonic == null) {
+            Button(
+                onClick = onGenerateMnemonic,
+                enabled = handle.isNotBlank(),
+                colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = PrimaryBlack),
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)
+            ) {
+                Text("Generate Word Cloud".tr, fontWeight = FontWeight.Bold)
+            }
+        } else {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = SurfaceDark),
+                border = BorderStroke(1.dp, AccentGreen),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp)
+                    .clickable { onCopyMnemonic(mnemonic) }
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "Word Cloud Password:".tr,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = AccentGreen,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(
+                        text = mnemonic,
+                        style = MaterialTheme.typography.bodyLarge.copy(
+                            fontFamily = FontFamily.Monospace,
+                            color = TextLight,
+                            lineHeight = 24.sp
+                        )
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.ContentCopy, contentDescription = null, tint = AccentGreen, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "Tap to Copy".tr,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = AccentGreen
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "⚠ Write this down! It is the ONLY way to recover your account.".tr,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = DestructiveRed
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun Step4Interests(
+    selectedInterests: List<String>,
+    onToggleInterest: (String) -> Unit
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = "What interests you?".tr,
+            style = MaterialTheme.typography.titleLarge,
+            color = TextLight,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(bottom = 8.dp)
+        )
+
+        Text(
+            text = "Select your favorite categories to help us suggest initial feeds.".tr,
+            style = MaterialTheme.typography.bodyMedium,
+            color = TextMuted,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 24.dp)
+        )
+
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(2),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)
+        ) {
+            gridItems(SourceLibrary.selectableCategories) { category ->
+                val isSelected = selectedInterests.contains(category)
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(80.dp)
+                        .clickable { onToggleInterest(category) },
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (isSelected) SurfaceDark else PrimaryBlack
+                    ),
+                    border = BorderStroke(1.dp, if (isSelected) AccentGreen else BorderSubtle),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text(
+                            text = category.tr,
+                            style = MaterialTheme.typography.titleSmall,
+                            color = if (isSelected) AccentGreen else TextLight,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(8.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@Composable
+fun Step5Creators(
+    selectedInterests: List<String>,
+    creatorKeywords: String,
+    onCreatorKeywordsChange: (String) -> Unit
+) {
+    // Derive suggestions from selected categories using the SourceLibrary map
+    val suggestions = remember(selectedInterests) {
+        com.noslop.app.feeds.SourceLibrary.getSuggestedCreatorsForCategories(selectedInterests)
+    }
+
+    // Parse the current keyword text into a set for chip highlighting
+    val currentKeywords = remember(creatorKeywords) {
+        creatorKeywords.split(",").map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+    }
+
+    var channelSearchQuery by remember { mutableStateOf("") }
+    var searchedChannels by remember { mutableStateOf<List<String>>(emptyList()) }
+    var isSearchingChannels by remember { mutableStateOf(false) }
+
+    LaunchedEffect(channelSearchQuery) {
+        if (channelSearchQuery.isBlank()) {
+            searchedChannels = emptyList()
+            isSearchingChannels = false
+            return@LaunchedEffect
+        }
+        isSearchingChannels = true
+        kotlinx.coroutines.delay(500) // Increase debounce to 500ms
+        try {
+            val ytChannels = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { com.noslop.app.feeds.api.YouTubeInternalClient.searchChannels(channelSearchQuery).take(10) }
+            if (ytChannels.isNotEmpty()) {
+                searchedChannels = ytChannels
+            } else {
+                throw Exception("YouTube returned empty")
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            com.noslop.app.debug.Logger.error("ONBOARDING", "Channel search failed: ${e.message}, trying fallback")
+            try {
+                val fallback = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    com.noslop.app.feeds.api.RedditApiClient.searchReddit(channelSearchQuery, "relevance")
+                        .mapNotNull { it.author }
+                        .distinct()
+                        .take(10)
+                }
+                searchedChannels = fallback
+            } catch (e2: kotlinx.coroutines.CancellationException) {
+                throw e2
+            } catch (e2: Exception) {
+                com.noslop.app.debug.Logger.error("ONBOARDING", "Fallback search failed: ${e2.message}")
+                searchedChannels = emptyList()
+            }
+        }
+        // Only clear the spinner if we weren't cancelled
+        isSearchingChannels = false
+    }
+    
+    val combinedSuggestions = remember(suggestions, searchedChannels) {
+        (searchedChannels + suggestions).distinct()
+    }
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = "Who do you follow?".tr,
+            style = MaterialTheme.typography.titleLarge,
+            color = TextLight,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(bottom = 4.dp)
+        )
+        Text(
+            text = "Add creators, channels, or outlets you love. NoSlop will surface their content across all your feeds. Tap suggestions or type your own.".tr,
+            style = MaterialTheme.typography.bodySmall,
+            color = TextMuted,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+        )
+
+        // Word-cloud: show suggestions above the text field so users pick from the cloud first
+        OutlinedTextField(
+            value = channelSearchQuery,
+            onValueChange = { channelSearchQuery = it },
+            label = { Text("Search channel names...".tr) },
+            leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = AccentGreen) },
+            trailingIcon = {
+                if (isSearchingChannels) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp), color = AccentGreen, strokeWidth = 2.dp)
+                } else if (channelSearchQuery.isNotBlank()) {
+                    IconButton(onClick = { channelSearchQuery = "" }) {
+                        Icon(Icons.Default.Close, contentDescription = "Clear".tr, tint = TextMuted)
+                    }
+                }
+            },
+            singleLine = true,
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = AccentGreen,
+                unfocusedBorderColor = BorderSubtle,
+                focusedTextColor = TextLight,
+                unfocusedTextColor = TextLight,
+                focusedLabelColor = AccentGreen,
+                unfocusedLabelColor = TextMuted
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp)
+        )
+
+        if (combinedSuggestions.isNotEmpty()) {
+            Text(
+                text = "SUGGESTED CHANNELS & CREATORS".tr,
+                style = MaterialTheme.typography.labelSmall,
+                color = AccentGreen,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 16.dp, top = 8.dp, bottom = 6.dp)
+            )
+
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .padding(horizontal = 12.dp)
+            ) {
+                item {
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        combinedSuggestions.forEach { creator ->
+                            val isSelected = currentKeywords.contains(creator)
+                            FilterChip(
+                                selected = isSelected,
+                                onClick = {
+                                    val updated = if (isSelected) {
+                                        currentKeywords - creator
+                                    } else {
+                                        currentKeywords + creator
+                                    }
+                                    onCreatorKeywordsChange(updated.joinToString(", "))
+                                },
+                                label = {
+                                    Text(
+                                        text = creator,
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    containerColor = PrimaryBlack,
+                                    labelColor = TextLight,
+                                    selectedContainerColor = AccentGreen.copy(alpha = 0.15f),
+                                    selectedLabelColor = AccentGreen
+                                ),
+                                border = FilterChipDefaults.filterChipBorder(
+                                    enabled = true,
+                                    selected = isSelected,
+                                    borderColor = if (isSelected) AccentGreen else BorderSubtle,
+                                    selectedBorderColor = AccentGreen
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        OutlinedTextField(
+            value = creatorKeywords,
+            onValueChange = onCreatorKeywordsChange,
+            label = { Text("Creators, channels, outlets (comma separated)".tr) },
+            placeholder = { Text("e.g. Linus Tech Tips, Veritasium, Krebs...".tr) },
+            minLines = 2,
+            maxLines = 4,
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = AccentGreen,
+                unfocusedBorderColor = BorderSubtle,
+                focusedTextColor = TextLight,
+                unfocusedTextColor = TextLight,
+                focusedLabelColor = AccentGreen,
+                unfocusedLabelColor = TextMuted
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp)
+        )
+    }
+}
+
+@Composable
+fun Step6Genres(
+    interests: List<String>,
+    selectedMusicGenres: MutableList<String>,
+    selectedVideoGenres: MutableList<String>,
+    onToggleMusicGenre: (String) -> Unit,
+    onToggleVideoGenre: (String) -> Unit
+) {
+    val showMusic = interests.contains("Music")
+    // Video is always included (not a selectable category) so always show video genres
+    val showVideo = true
+    
+    val musicGenres = listOf(
+        "Electronic", "Ambient", "Rock", "Lo-Fi", "Classical", "Hip-Hop", "Jazz", "Pop",
+        "Metal", "R&B", "Country", "Reggae", "Blues", "Indie", "Soul", "Punk"
+    )
+    val videoGenres = listOf(
+        "Education", "Tech", "Gaming", "Science", "Entertainment", "News", "Documentary",
+        "Comedy", "Music Videos", "Sports", "Travel", "DIY & How-To", "Animation", "Film & Cinema"
+    )
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        if (!showMusic && !showVideo) {
+            Text(
+                text = "No genres to select based on your interests.".tr,
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextMuted,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(16.dp)
+            )
+            return
+        }
+
+        Text(
+            text = "Refine your taste".tr,
+            style = MaterialTheme.typography.titleLarge,
+            color = TextLight,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(bottom = 8.dp)
+        )
+
+        Text(
+            text = "Choose specific genres for your dynamic media streams.".tr,
+            style = MaterialTheme.typography.bodyMedium,
+            color = TextMuted,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(bottom = 16.dp)
+        )
+
+        LazyColumn(
+            modifier = Modifier.fillMaxHeight().padding(horizontal = 8.dp)
+        ) {
+            if (showMusic) {
+                item {
+                    Text("Music Genres".tr, style = MaterialTheme.typography.titleMedium, color = AccentGreen, modifier = Modifier.padding(vertical = 8.dp))
+                }
+                items(musicGenres) { genre ->
+                    val isSelected = selectedMusicGenres.contains(genre)
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp)
+                            .clickable { onToggleMusicGenre(genre) },
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (isSelected) SurfaceDark else PrimaryBlack
+                        ),
+                        border = BorderStroke(1.dp, if (isSelected) AccentGreen else BorderSubtle),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(genre.tr, color = TextLight, fontWeight = FontWeight.Bold)
+                            Checkbox(
+                                checked = isSelected,
+                                onCheckedChange = { onToggleMusicGenre(genre) },
+                                colors = CheckboxDefaults.colors(checkedColor = AccentGreen, checkmarkColor = PrimaryBlack, uncheckedColor = TextMuted)
+                            )
+                        }
+                    }
+                }
+            }
+            if (showVideo) {
+                item {
+                    Text("Video Genres".tr, style = MaterialTheme.typography.titleMedium, color = AccentGreen, modifier = Modifier.padding(top = 16.dp, bottom = 8.dp))
+                }
+                items(videoGenres) { genre ->
+                    val isSelected = selectedVideoGenres.contains(genre)
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp)
+                            .clickable { onToggleVideoGenre(genre) },
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (isSelected) SurfaceDark else PrimaryBlack
+                        ),
+                        border = BorderStroke(1.dp, if (isSelected) AccentGreen else BorderSubtle),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(genre.tr, color = TextLight, fontWeight = FontWeight.Bold)
+                            Checkbox(
+                                checked = isSelected,
+                                onCheckedChange = { onToggleVideoGenre(genre) },
+                                colors = CheckboxDefaults.colors(checkedColor = AccentGreen, checkmarkColor = PrimaryBlack, uncheckedColor = TextMuted)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun Step7Feeds(
+    interests: List<String>,
+    selectedSources: List<BuiltInSource>,
+    onToggleSource: (BuiltInSource) -> Unit
+) {
+    val context = LocalContext.current
+    val apiKeyRepository = remember { com.noslop.app.data.ApiKeyRepository(context) }
+    var showApiWarningFor by remember { mutableStateOf<String?>(null) }
+    
+    // Include always-included categories (Video Platforms, Social Clearnet) alongside user interests
+    val effectiveInterests = remember(interests) {
+        (interests + SourceLibrary.alwaysIncludedCategories).distinct()
+    }
+    
+    val suggestedSources = remember(effectiveInterests) {
+        SourceLibrary.sources.filter { effectiveInterests.contains(it.category) }
+    }
+
+    var hasPreselected by remember { mutableStateOf(false) }
+
+    LaunchedEffect(suggestedSources) {
+        if (!hasPreselected && suggestedSources.isNotEmpty()) {
+            suggestedSources.forEach { src ->
+                val isApiSource = src.feedType == "api"
+                val serviceId = if (isApiSource) src.url.split(":").first() else null
+                val requiresKey = serviceId != null && com.noslop.app.data.ApiKeyRepository.SERVICES.find { it.id == serviceId }?.requiresUserKey == true
+                val hasKey = if (requiresKey) apiKeyRepository.hasKey(serviceId!!) else true
+                
+                if (!selectedSources.contains(src) && (!requiresKey || hasKey)) {
+                    onToggleSource(src)
+                }
+            }
+            hasPreselected = true
+        }
+    }
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = "Suggested Clearnet Feeds".tr,
+            style = MaterialTheme.typography.titleLarge,
+            color = TextLight,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(bottom = 8.dp)
+        )
+
+        Text(
+            text = "Based on your interests, we recommend these sources.".tr,
+            style = MaterialTheme.typography.bodySmall,
+            color = TextMuted,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 8.dp)
+        )
+
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(1),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxHeight().padding(horizontal = 16.dp)
+        ) {
+            gridItems(suggestedSources) { src: BuiltInSource ->
+                val isSelected = selectedSources.contains(src)
+                
+                val isApiSource = src.feedType == "api"
+                val serviceId = if (isApiSource) src.url.split(":").first() else null
+                val requiresKey = serviceId != null && com.noslop.app.data.ApiKeyRepository.SERVICES.find { it.id == serviceId }?.requiresUserKey == true
+                val hasKey = if (requiresKey) apiKeyRepository.hasKey(serviceId!!) else true
+                val alpha = if (!isSelected && requiresKey && !hasKey) 0.5f else 1f
+
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .alpha(alpha)
+                        .clickable { 
+                            if (!isSelected && requiresKey && !hasKey) {
+                                showApiWarningFor = src.title
+                            } else {
+                                onToggleSource(src) 
+                            }
+                        },
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (isSelected) SurfaceDark else PrimaryBlack
+                    ),
+                    border = BorderStroke(1.dp, if (isSelected) AccentGreen else BorderSubtle),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = src.title,
+                                style = MaterialTheme.typography.titleMedium,
+                                color = TextLight,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = src.category,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = AccentGreen
+                            )
+                        }
+                        Checkbox(
+                            checked = isSelected,
+                            onCheckedChange = { 
+                                if (!isSelected && requiresKey && !hasKey) {
+                                    showApiWarningFor = src.title
+                                } else {
+                                    onToggleSource(src) 
+                                }
+                            },
+                            colors = CheckboxDefaults.colors(
+                                checkedColor = AccentGreen,
+                                checkmarkColor = PrimaryBlack,
+                                uncheckedColor = TextMuted
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    if (showApiWarningFor != null) {
+        AlertDialog(
+            onDismissRequest = { showApiWarningFor = null },
+            title = { Text("API Key Required".tr, color = AccentGreen) },
+            text = { Text("To enable ${showApiWarningFor}, you must first configure its API key in Settings -> API Keys. Please skip it for now and come back later.", color = TextLight) },
+            confirmButton = {
+                TextButton(onClick = { showApiWarningFor = null }) {
+                    Text("OK".tr, color = AccentGreen)
+                }
+            },
+            containerColor = SurfaceDark
+        )
+    }
+}
+
+
+
+@Composable
+fun Step8FeedMix(
+    viewModel: NoSlopViewModel
+) {
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = "Content Mix".tr,
+            style = MaterialTheme.typography.titleLarge,
+            color = TextLight,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.padding(bottom = 8.dp)
+        )
+        Text(
+            text = "Tune the proportion of content types you want to see in your feed.".tr,
+            style = MaterialTheme.typography.bodyMedium,
+            color = TextMuted,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(start = 24.dp, end = 24.dp, bottom = 24.dp)
+        )
+
+        // NOSLOP_CONTENT_MIX_SCROLL_V1
+        // Must be a scrolling Column, not a Box. FeedMixSettingsSection emits its
+        // header and its card as siblings with no container of its own, so a Box
+        // draws them on top of each other; and without a scroll the card's inner
+        // Column overflows the constrained height, which collapses the lower
+        // sliders onto one another and puts the rest out of reach.
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp)
+        ) {
+            com.noslop.app.ui.tabs.FeedMixSettingsSection(viewModel = viewModel)
+        }
+    }
+}

@@ -1,0 +1,187 @@
+// FILE: app/src/main/java/com/noslop/app/mesh/CommentPacketHandler.kt
+package com.noslop.app.mesh
+
+import com.noslop.app.data.*
+import com.noslop.app.crypto.CryptoService
+import com.noslop.app.debug.Logger
+import java.util.*
+
+/**
+ * Handles incoming COMMENT mesh packets (handleComment).
+ *
+ * Extracted from the monolithic MeshPacketHandler (Phase 0, Stage 0.3) into one handler per packet
+ * domain behind a dispatcher. Constructed with (repo, db) like the original; method bodies are a
+ * verbatim move (ADR-004). The dispatcher routes by packet type; this class owns the per-type logic.
+ */
+class CommentPacketHandler(
+    private val repo: NoSlopRepository,
+    private val db: NoSlopDatabase
+) {
+    private val TAG = "MESH_HANDLER"
+    private val postDao = db.postDao()
+    private val commentDao = db.commentDao()
+    private val notificationDao = db.notificationDao()
+
+    suspend fun handleComment(packet: NetworkPacket): Boolean {
+        val commPay = packet.getCommentPayload() ?: return false
+        val mediaHash = commPay.comment.mediaMetadata?.sha256
+        val encPayloadV2 = if (mediaHash != null) {
+            com.noslop.app.crypto.CryptoService.encodeForSigning(
+                commPay.postId, commPay.comment.id, commPay.comment.content, commPay.comment.timestamp.toString(), commPay.comment.authorAvatarB64, mediaHash
+            )
+        } else null
+        val encPayload = com.noslop.app.crypto.CryptoService.encodeForSigning(
+            commPay.postId, commPay.comment.id, commPay.comment.content, commPay.comment.timestamp.toString(), commPay.comment.authorAvatarB64
+        )
+        val encPayloadNoAvatar = com.noslop.app.crypto.CryptoService.encodeForSigning(
+            commPay.postId, commPay.comment.id, commPay.comment.content, commPay.comment.timestamp.toString()
+        )
+        var pipePayload = "${commPay.postId}|${commPay.comment.id}|${commPay.comment.content}|${commPay.comment.timestamp}"
+        if (commPay.comment.authorAvatarB64 != null) {
+            pipePayload += "|${commPay.comment.authorAvatarB64}"
+        }
+        val isV2 = encPayloadV2 != null && CryptoService.verify(encPayloadV2, commPay.comment.signature, commPay.comment.authorId)
+        val isValid = isV2 ||
+            CryptoService.verify(encPayload, commPay.comment.signature, commPay.comment.authorId) ||
+            CryptoService.verify(encPayloadNoAvatar, commPay.comment.signature, commPay.comment.authorId) ||
+            CryptoService.verify(pipePayload, commPay.comment.signature, commPay.comment.authorId)
+        if (!isValid) {
+            Logger.warn(TAG, "Rejected gossip comment: Signature verification failed")
+            return false
+        }
+        val meshComment = MeshComment(
+            id = commPay.comment.id,
+            postId = commPay.postId,
+            authorPublicKeyB64 = commPay.comment.authorId,
+            authorHandle = commPay.comment.authorName,
+            authorAvatarB64 = commPay.comment.authorAvatarB64,
+            content = commPay.comment.content,
+            timestamp = commPay.comment.timestamp,
+            signature = commPay.comment.signature,
+            parentCommentId = commPay.parentCommentId,
+            mediaId = commPay.comment.mediaId,
+            mediaType = commPay.comment.mediaType
+        )
+        // P1-A: a replayed COMMENT must not restore a deleted comment or roll back an edit.
+        if (!commentDao.insertCommentSafely(meshComment)) {
+            Logger.debug(TAG, "Dropping COMMENT ${commPay.comment.id}: deleted, author mismatch, or not newer than the stored revision")
+            return true
+        }
+        // R2: keep the signed digest (sync re-serving, download verification).
+        if (isV2) repo.recordMediaDigest(commPay.comment.mediaId, mediaHash)
+        
+        if (commPay.comment.mediaId != null) {
+            val authorPeer = repo.peerDao.getPeerByPublicKey(commPay.comment.authorId)
+            val peerOnion = authorPeer?.onionAddress ?: packet.senderId
+            val fakeMeta = com.noslop.app.mesh.MediaMetadata(
+                id = commPay.comment.mediaId,
+                type = commPay.comment.mediaType ?: "image",
+                mimeType = "application/octet-stream",
+                size = 0,
+                chunkCount = 0,
+                originNode = peerOnion,
+                ownerId = commPay.comment.authorId,
+                sha256 = if (isV2) mediaHash else null
+            )
+            com.noslop.app.mesh.MediaManager.checkAndAutoDownload(
+                fakeMeta,
+                "friends",
+                commPay.comment.authorId,
+                peerOnion
+            )
+        }
+
+        // Notify if it's on our post (unless it's from ourselves)
+        val post = postDao.getPostById(commPay.postId)
+        val localKeys = repo.getLocalIdentity()
+        val notifSettings = repo.notificationSettingsFlow.value
+        if (notifSettings.comments && post?.authorPublicKeyB64 == localKeys?.publicKeyB64 && commPay.comment.authorId != localKeys?.publicKeyB64) {
+            val title = com.noslop.app.util.LanguageManager.translate("New Comment")
+            val msg = com.noslop.app.util.LanguageManager.translate("{author} commented: {content}")
+                .replace("{author}", commPay.comment.authorName)
+                .replace("{content}", commPay.comment.content.take(50))
+            val route = "post/${commPay.postId}/comment/${commPay.comment.id}"
+            
+            notificationDao.insertNotification(
+                NotificationItem(
+                    id = UUID.randomUUID().toString(),
+                    type = "COMMENT",
+                    title = title,
+                    body = msg,
+                    targetRoute = route,
+                    iconType = "comment",
+                    senderPub = commPay.comment.authorId
+                )
+            )
+
+            com.noslop.app.util.NotificationHelper.showNotification(
+                context = repo.context,
+                title = title,
+                message = msg,
+                deepLinkRoute = route
+            )
+        }
+        
+        Logger.info(TAG, "Valid signed comment accepted and stored: from=${commPay.comment.authorName}")
+        return true
+    }
+
+    suspend fun handleEditComment(packet: NetworkPacket): Boolean {
+        val editPay = packet.getEditCommentPayload() ?: return false
+        val encWithAvatar = com.noslop.app.crypto.CryptoService.encodeForSigning(
+            editPay.postId, editPay.commentId, editPay.content, editPay.timestamp.toString(), editPay.authorAvatarB64
+        )
+        val encNoAvatar = com.noslop.app.crypto.CryptoService.encodeForSigning(
+            editPay.postId, editPay.commentId, editPay.content, editPay.timestamp.toString()
+        )
+        var pipePayload = "${editPay.postId}|${editPay.commentId}|${editPay.content}|${editPay.timestamp}"
+        if (editPay.authorAvatarB64 != null) {
+            pipePayload += "|${editPay.authorAvatarB64}"
+        }
+        val isValid = CryptoService.verify(encWithAvatar, editPay.signature, editPay.authorId) ||
+            CryptoService.verify(encNoAvatar, editPay.signature, editPay.authorId) ||
+            CryptoService.verify(pipePayload, editPay.signature, editPay.authorId)
+        if (!isValid) return false
+
+        val existingComment = commentDao.getCommentById(editPay.commentId)
+        if (existingComment != null) {
+            if (existingComment.authorPublicKeyB64 != editPay.authorId) {
+                Logger.warn(TAG, "Rejected EDIT_COMMENT: Author mismatch")
+                return false
+            }
+            // P1-A: an edit never revives a deleted comment, and an older edit never wins.
+            if (commentDao.editCommentSafely(editPay.commentId, editPay.authorId, editPay.content, editPay.timestamp, editPay.signature)) {
+                Logger.info(TAG, "Applied EDIT_COMMENT for ${editPay.commentId}")
+            }
+        }
+        return true
+    }
+
+    suspend fun handleDeleteComment(packet: NetworkPacket): Boolean {
+        val deletePay = packet.getDeleteCommentPayload() ?: return false
+        val encPayload = com.noslop.app.crypto.CryptoService.encodeForSigning(
+            deletePay.postId, deletePay.commentId, deletePay.authorId, deletePay.timestamp.toString()
+        )
+        val pipePayload = "${deletePay.postId}|${deletePay.commentId}|${deletePay.authorId}|${deletePay.timestamp}"
+        val isValid = CryptoService.verify(encPayload, deletePay.signature, deletePay.authorId) ||
+            CryptoService.verify(pipePayload, deletePay.signature, deletePay.authorId)
+        if (!isValid) return false
+
+        val existingComment = commentDao.getCommentById(deletePay.commentId)
+        if (existingComment != null) {
+            if (existingComment.authorPublicKeyB64 != deletePay.authorId) {
+                Logger.warn(TAG, "Rejected DELETE_COMMENT: Author mismatch")
+                return false
+            }
+            if (deletePay.timestamp >= existingComment.timestamp) {
+                // P1-A: also tombstoned, so a replayed COMMENT / EDIT_COMMENT cannot bring it back.
+                commentDao.deleteCommentWithTombstone(deletePay.commentId, deletePay.authorId, deletePay.timestamp)
+                Logger.info(TAG, "Applied DELETE_COMMENT for ${deletePay.commentId}")
+            }
+        } else {
+            // P1-A: delete-before-create. Remember the signed deletion so the comment is not stored later.
+            commentDao.deleteCommentWithTombstone(deletePay.commentId, deletePay.authorId, deletePay.timestamp)
+        }
+        return true
+    }
+}
