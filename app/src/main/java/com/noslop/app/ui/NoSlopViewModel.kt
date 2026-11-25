@@ -3146,6 +3146,42 @@ fun toggleAggregator() {
 
 
 
+    /**
+     * NOSLOP_CHAT_REFRESH_V1 (2026-11-25): the chat's refresh button. Starts Tor again when it stopped (the app
+     * was in the background for long), pulls what the Home HUB holds for this phone (its inbox and the Web UI's
+     * messages) right away instead of at the next background round, then sends what is waiting for this contact
+     * and asks them for anything missed (DM_SYNC_REQUEST). At most two minutes; the button shows it is working.
+     */
+    private val _chatRefreshing = kotlinx.coroutines.flow.MutableStateFlow(false)
+    val chatRefreshing: kotlinx.coroutines.flow.StateFlow<Boolean> = _chatRefreshing
+
+    fun refreshChat(peer: Peer) {
+        if (_chatRefreshing.value) return
+        _chatRefreshing.value = true
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                when (TorService.torState.value) {
+                    TorState.FAILED -> startTor(forceRestart = true)
+                    TorState.IDLE -> startTor(forceRestart = false)
+                    else -> {}
+                }
+                kotlinx.coroutines.withTimeoutOrNull(120_000L) {
+                    if (!repository.getAppSetting("hub_deployment_status").isNullOrBlank()) {
+                        com.noslop.app.data.HubClient.clearOnionBackoff()
+                        repository.pullMeshPacketsFromHub()
+                        repository.syncDmsWithHub()
+                    }
+                    repository.flushOutboxForPeer(peer.publicKeyB64, peer.onionAddress, force = true)
+                    repository.requestDmSync(peer)
+                }
+            } catch (e: Exception) {
+                Logger.warn("VM", "Chat refresh did not finish: ${e.message}")
+            } finally {
+                _chatRefreshing.value = false
+            }
+        }
+    }
+
     fun syncDmsWithPeer(peer: Peer) {
         viewModelScope.launch(Dispatchers.IO) {
             repository.flushOutboxForPeer(peer.publicKeyB64, peer.onionAddress, force = true)
@@ -3935,21 +3971,6 @@ fun clearLogFile() { Logger.clearLog() }
                 }
 
                 val signature = CryptoService.sign(sessionId, identity.privateKeyB64)
-                
-                val isOnion = targetIp.endsWith(".onion")
-                val proxy = if (isOnion) {
-                    java.net.Proxy(java.net.Proxy.Type.SOCKS, java.net.InetSocketAddress(com.noslop.app.tor.TorService.PROXY_HOST, com.noslop.app.tor.TorService.SOCKS_PORT))
-                } else {
-                    java.net.Proxy.NO_PROXY
-                }
-                
-                val url = java.net.URL("http://$targetIp:8080/api/auth/qr/verify")
-                val connection = url.openConnection(proxy) as java.net.HttpURLConnection
-                connection.requestMethod = "POST"
-                connection.setRequestProperty("Content-Type", "application/json")
-                connection.connectTimeout = 5000
-                connection.readTimeout = 5000
-                connection.doOutput = true
 
                 val payload = org.json.JSONObject().apply {
                     put("session_id", sessionId)
@@ -3957,19 +3978,36 @@ fun clearLogFile() { Logger.clearLog() }
                     put("signature", signature)
                 }.toString()
 
-                connection.outputStream.use { os ->
-                    val input = payload.toByteArray(Charsets.UTF_8)
-                    os.write(input, 0, input.size)
+                // NOSLOP_HUB_QR_LOGIN_ROUTE_V1: the same routes as every other Hub call. Plain HTTP to a LAN
+                // address is refused by the network security config unless that host is listed there, so the
+                // login also goes to the Hub's onion over Tor (the Hub keeps the browser's session in memory,
+                // whichever address it was reached on).
+                // Opening the app to scan often (re)starts its Tor: wait for it instead of failing at once, and try
+                // once more if the first, cold connection to the Hub's onion gets no answer.
+                if (com.noslop.app.tor.TorService.torState.value != com.noslop.app.tor.TorState.READY) {
+                    Logger.info("QR_LOGIN", "Waiting for Tor before reaching the Hub")
+                    withContext(Dispatchers.Main) {
+                        android.widget.Toast.makeText(getApplication(), com.noslop.app.util.LanguageManager.translate("Connecting to Tor network..."), android.widget.Toast.LENGTH_LONG).show()
+                    }
+                    if (!com.noslop.app.tor.TorService.awaitReady(90_000L)) Logger.warn("QR_LOGIN", "Tor is not ready; only a LAN route can work")
                 }
+                val body = payload.toByteArray(Charsets.UTF_8)
+                var reply = com.noslop.app.data.HubClient.postUnsigned(repository, "/api/auth/qr/verify", body, scannedHost = targetIp)
+                if (reply == null && com.noslop.app.tor.TorService.torState.value == com.noslop.app.tor.TorState.READY) {
+                    Logger.info("QR_LOGIN", "No answer from the Hub yet; trying once more")
+                    kotlinx.coroutines.delay(3_000)
+                    reply = com.noslop.app.data.HubClient.postUnsigned(repository, "/api/auth/qr/verify", body, scannedHost = targetIp)
+                }
+                if (reply == null) throw java.io.IOException("the Hub could not be reached on its LAN address or its onion")
 
-                val responseCode = connection.responseCode
+                val responseCode = reply.code
                 Logger.info("QR_LOGIN", "Hub responded with HTTP $responseCode")
                 withContext(Dispatchers.Main) {
                     if (responseCode == 200) {
                         Logger.info("QR_LOGIN", "Successfully authenticated with Hub at $targetIp")
                         android.widget.Toast.makeText(getApplication(), com.noslop.app.util.LanguageManager.translate("Successfully authenticated with Hub!"), android.widget.Toast.LENGTH_LONG).show()
                     } else {
-                        val errorBody = try { connection.errorStream?.bufferedReader()?.use { it.readText() } ?: "" } catch (_: Exception) { "" }
+                        val errorBody = reply.body.take(300)
                         Logger.error("QR_LOGIN", "Failed to authenticate with Hub at $targetIp. Code: $responseCode, Body: $errorBody")
                         if (responseCode == 401) {
                             android.widget.Toast.makeText(getApplication(), com.noslop.app.util.LanguageManager.translate("Failed to authenticate: Identity mismatch."), android.widget.Toast.LENGTH_LONG).show()

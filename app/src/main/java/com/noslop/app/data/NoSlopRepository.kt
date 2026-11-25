@@ -260,9 +260,14 @@ class NoSlopRepository(val context: Context, private val db: NoSlopDatabase) {
     }
 
         suspend fun syncDmsWithHub() = withContext(Dispatchers.IO) {
+        uploadPendingDmMediaToHub()
         if (!shouldSyncDms) return@withContext
         shouldSyncDms = false
         val identity = getLocalIdentity() ?: return@withContext
+        // NOSLOP_HUB_DM_MIRROR_KEYS_V1: DMs with a creator contact are encrypted to the creator identity; decrypt
+        // them as ChatThreadScreen does (personal keys, then the creator keys) instead of mirroring "..." to the Hub.
+        val burnable = getBurnableIdentity()
+        var undecryptable = 0
         val peers = peerDao.getAllPeersList()
         val dmArray = JSONArray()
         
@@ -273,19 +278,36 @@ class NoSlopRepository(val context: Context, private val db: NoSlopDatabase) {
                 val messages = kotlinx.coroutines.withTimeoutOrNull(2000L) {
                     messageDao.getMessagesWithPeer(peer.publicKeyB64).first()
                 }?.takeLast(30) ?: emptyList()
+                val opponentEncPub = if (peer.encPublicKeyB64.isNotEmpty()) peer.encPublicKeyB64 else peer.publicKeyB64
                 messages.forEach { msg ->
                     val plaintext = com.noslop.app.crypto.CryptoService.decryptDMForDisplay(
                         ciphertextB64 = msg.ciphertext,
                         nonceB64 = msg.nonce,
-                        theirEncPubB64 = peer.encPublicKeyB64,
+                        theirEncPubB64 = opponentEncPub,
                         myEncPrivB64 = identity.encPrivateKeyB64,
                         myEdPub = identity.publicKeyB64,
                         senderEdPub = msg.senderPub,
                         peerEdPub = peer.publicKeyB64,
                         msgId = msg.id,
                         timestamp = msg.timestamp
-                    )
-                    var contentStr = plaintext ?: "..."
+                    ) ?: burnable?.let { b ->
+                        com.noslop.app.crypto.CryptoService.decryptDMForDisplay(
+                            ciphertextB64 = msg.ciphertext,
+                            nonceB64 = msg.nonce,
+                            theirEncPubB64 = opponentEncPub,
+                            myEncPrivB64 = b.encPrivateKeyB64,
+                            myEdPub = b.publicKeyB64,
+                            senderEdPub = msg.senderPub,
+                            peerEdPub = peer.publicKeyB64,
+                            msgId = msg.id,
+                            timestamp = msg.timestamp
+                        )
+                    }
+                    if (plaintext == null) {
+                        undecryptable++ // never mirror a placeholder: the Hub would show it as the message
+                        return@forEach
+                    }
+                    var contentStr: String = plaintext
                     val obj = JSONObject()
                     var hasMedia = false
                     try {
@@ -299,6 +321,7 @@ class NoSlopRepository(val context: Context, private val db: NoSlopDatabase) {
                             obj.put("mediaType", mediaJson.optString("type"))
                             obj.put("media", mediaJson)
                             hasMedia = true
+                            noteDmMediaForHub(mediaJson, msg.id, msg.timestamp, peer.publicKeyB64, msg.senderPub, identity.publicKeyB64, burnable?.publicKeyB64)
                         }
                     } catch (e: Exception) {}
                     
@@ -319,11 +342,109 @@ class NoSlopRepository(val context: Context, private val db: NoSlopDatabase) {
                 com.noslop.app.debug.Logger.error("HUB_SYNC", "Failed to sync DMs for ${peer.handle}: ${e.message}")
             }
         }
+        if (undecryptable > 0) com.noslop.app.debug.Logger.warn("HUB_SYNC", "$undecryptable DM(s) could not be decrypted here and were not mirrored to the Hub")
         if (dmArray.length() > 0) {
             val args = JSONObject().put("dms", dmArray)
             val res = invokeHubApi("sync_push_dms", args)
             if (res != null) com.noslop.app.debug.Logger.info("HUB_SYNC", "Pushed ${dmArray.length()} DMs to Hub.")
         }
+    }
+
+    /**
+     * NOSLOP_HUB_DM_MEDIA_V1 — the Hub's Web UI chat shows DM attachments. It fetches a contact's attachments
+     * itself; the ones this phone holds (its own, and those it downloaded) it gets from here: every DM with an
+     * attachment that is mirrored is noted, and [uploadPendingDmMediaToHub] uploads what the Hub does not have
+     * yet (`hub_dm_media_info`, then `dm_media_put` in resumable chunks), at most once a minute and 32 MB a round.
+     */
+    private data class DmMediaForHub(
+        val mediaId: String, val dmId: String, val dmTs: Long, val peer: String, val asKey: String,
+        val type: String, val mime: String, val sha256: String?, val incoming: Boolean, val notedAt: Long
+    )
+    private val dmMediaForHub = java.util.concurrent.ConcurrentHashMap<String, DmMediaForHub>()
+    @Volatile private var lastDmMediaUpload = 0L
+
+    private suspend fun noteDmMediaForHub(media: JSONObject, dmId: String, dmTs: Long, peer: String, sender: String, personal: String, creator: String?) {
+        val id = media.optString("id")
+        if (id.isBlank() || id.startsWith("noslop-gif://") || !com.noslop.app.mesh.MediaManager.isValidMediaId(id)) return
+        if (dmMediaForHub.containsKey(id) || dmMediaForHub.size >= 500) return
+        val outgoing = sender == personal || (creator != null && sender == creator)
+        val asKey = if (outgoing) sender else if (creator != null && appSettingDao.getSetting("contact_identity_$peer") == "burnable") creator else personal
+        dmMediaForHub[id] = DmMediaForHub(
+            mediaId = id, dmId = dmId, dmTs = dmTs, peer = peer, asKey = asKey,
+            type = media.optString("type").ifBlank { "file" }, mime = media.optString("mime_type").ifBlank { "application/octet-stream" },
+            sha256 = media.optString("sha256").takeIf { it.length == 64 }, incoming = !outgoing, notedAt = System.currentTimeMillis()
+        )
+    }
+
+    private suspend fun uploadPendingDmMediaToHub() {
+        if (dmMediaForHub.isEmpty()) return
+        val now = System.currentTimeMillis()
+        if (now - lastDmMediaUpload < 60_000L) return
+        lastDmMediaUpload = now
+        // An attachment this phone never downloaded is the Hub's to fetch; it is not asked about forever.
+        dmMediaForHub.values.filter { now - it.notedAt > 3L * 24 * 60 * 60_000 }.forEach { dmMediaForHub.remove(it.mediaId) }
+        val batch = dmMediaForHub.values.sortedBy { it.dmTs }.takeLast(50)
+        if (batch.isEmpty()) return
+        val ids = com.google.gson.JsonArray().apply { batch.forEach { add(it.mediaId) } }
+        val res = HubClient.invoke(this@NoSlopRepository, "hub_dm_media_info", com.google.gson.JsonObject().apply { add("media_ids", ids) }) ?: return
+        val states = HashMap<String, String>()
+        res.get("items")?.takeIf { it.isJsonArray }?.asJsonArray?.forEach { el ->
+            val o = el.asJsonObject
+            val id = o.get("media_id")?.asString ?: return@forEach
+            states[id] = o.get("state")?.asString ?: ""
+        }
+        var budget = 32L * 1024 * 1024
+        for (item in batch) {
+            if (budget <= 0) break
+            when (states[item.mediaId]) {
+                "complete", "too_large" -> { dmMediaForHub.remove(item.mediaId); continue }
+            }
+            val file = com.noslop.app.mesh.MediaManager.getLocalFile(item.mediaId) ?: continue // not on this phone (yet)
+            val (sent, complete) = uploadDmMediaToHub(item, file, budget)
+            budget -= sent
+            if (complete) dmMediaForHub.remove(item.mediaId)
+        }
+    }
+
+    /** Uploads one DM attachment (plaintext, from MediaCrypto); returns bytes sent and whether the Hub has it all. */
+    private suspend fun uploadDmMediaToHub(item: DmMediaForHub, file: java.io.File, budget: Long): Pair<Long, Boolean> {
+        val digest = item.sha256 ?: mediaDigestFor(item.mediaId) ?: return 0L to false
+        val size = com.noslop.app.mesh.MediaCrypto.contentLength(file)
+        if (size <= 0) return 0L to false
+        val key = com.noslop.app.mesh.MediaVault.key()
+        var offset = 0L
+        var sent = 0L
+        while (offset < size && sent < budget) {
+            val len = minOf(512L * 1024, size - offset).toInt()
+            val buf = ByteArray(len)
+            val read = com.noslop.app.mesh.MediaCrypto.readAt(file, key, offset, buf)
+            if (read != len) { Logger.warn("HUB_SYNC", "Could not read DM attachment ${item.mediaId} at $offset"); return sent to false }
+            val args = com.google.gson.JsonObject().apply {
+                addProperty("media_id", item.mediaId)
+                addProperty("sha256", digest)
+                addProperty("size", size)
+                addProperty("offset", offset)
+                addProperty("data", android.util.Base64.encodeToString(buf, android.util.Base64.NO_WRAP))
+                addProperty("peer", item.peer)
+                addProperty("dm_id", item.dmId)
+                addProperty("dm_ts", item.dmTs)
+                addProperty("as_key", item.asKey)
+                addProperty("incoming", item.incoming)
+                addProperty("type", item.type)
+                addProperty("mime_type", item.mime)
+            }
+            val res = HubClient.invoke(this@NoSlopRepository, "dm_media_put", args, longTransfer = true) ?: return sent to false
+            val status = res.get("status")?.asString
+            if (res.get("complete")?.asBoolean == true) {
+                Logger.info("HUB_SYNC", "DM attachment ${item.mediaId} is on the Hub ($size bytes)")
+                return (sent + if (status == "ok") len.toLong() else 0L) to true
+            }
+            if (status == "busy") return sent to false // the Hub is fetching it from the contact right now
+            val received = res.get("received")?.asLong ?: return sent to false
+            if (status == "ok") sent += len
+            offset = received
+        }
+        return sent to false
     }
 
     suspend fun ensureAdminPeerExists() = withContext(Dispatchers.IO) {
@@ -354,6 +475,7 @@ class NoSlopRepository(val context: Context, private val db: NoSlopDatabase) {
         ensureAdminPeerExists()
 
         val myKeys = getLocalIdentity() ?: return@withContext
+        val burnable = getBurnableIdentity()
 
         // 1. Pull DMs
         val resDms = invokeHubApi("get_dms", JSONObject())
@@ -371,8 +493,9 @@ class NoSlopRepository(val context: Context, private val db: NoSlopDatabase) {
                     val peerEncPub = peer?.encPublicKeyB64?.takeIf { it.isNotBlank() } ?: peerPub
                     
                     val map = mutableMapOf<String, Any>("content" to contentStr)
-                    val mediaId = dm.optString("mediaId").takeIf { it.isNotBlank() }
-                    val mediaType = dm.optString("mediaType").takeIf { it.isNotBlank() }
+                    // NOSLOP_HUB_WEBUI_SEND_V1: older Hubs sent "mediaId": null, which optString turns into "null".
+                    val mediaId = dm.optString("mediaId").takeIf { it.isNotBlank() && it != "null" }
+                    val mediaType = dm.optString("mediaType").takeIf { it.isNotBlank() && it != "null" }
                     if (mediaId != null) {
                         val metadata = com.noslop.app.mesh.MediaMetadata(
                             id = mediaId,
@@ -386,7 +509,9 @@ class NoSlopRepository(val context: Context, private val db: NoSlopDatabase) {
                     }
                     val contentToSend = com.noslop.app.util.Json.gson.toJson(map)
                     val dmTimestamp = dm.optLong("timestamp", System.currentTimeMillis())
-                    val (ciphertext, nonce) = sealHubDm(contentToSend, id, sender, peerPub, peerEncPub, myKeys, dmTimestamp)
+                    // Our own messages written as the creator are sealed with the creator keys, so they open here.
+                    val sealKeys = burnable?.takeIf { it.publicKeyB64 == sender } ?: myKeys
+                    val (ciphertext, nonce) = sealHubDm(contentToSend, id, sender, peerPub, peerEncPub, sealKeys, dmTimestamp)
                     
                     if (ciphertext != null && nonce != null) {
                         val localMsg = com.noslop.app.data.ChatMessage(
@@ -516,6 +641,7 @@ class NoSlopRepository(val context: Context, private val db: NoSlopDatabase) {
 
     private suspend fun syncPullIncrementalDMsFromHub() = withContext(Dispatchers.IO) {
         val myKeys = getLocalIdentity() ?: return@withContext
+        val burnable = getBurnableIdentity()
         val args = JSONObject().put("since", lastDmSyncTimestamp)
         val resDms = invokeHubApi("sync_pull_dms", args)
         
@@ -535,13 +661,22 @@ class NoSlopRepository(val context: Context, private val db: NoSlopDatabase) {
                     val contentStr = dm.optString("content")
                     val sender = dm.optString("sender")
                     val peerPub = dm.optString("peer")
+                    // NOSLOP_HUB_WEBUI_SEND_V1: only our own messages (typed in the Hub's Web UI) are taken from
+                    // here. A contact's DM reaches this phone through the Hub inbox, signature-checked; since the
+                    // Hub opens DMs for its Web UI (NOSLOP_HUB_DM_VIEW_V1) this list also holds those.
+                    val ownKeys = when (sender) {
+                        myKeys.publicKeyB64 -> myKeys
+                        burnable?.publicKeyB64 -> burnable
+                        else -> null
+                    } ?: continue
                     
                     val peer = peerDao.getPeerByPublicKey(peerPub)
                     val peerEncPub = peer?.encPublicKeyB64?.takeIf { it.isNotBlank() } ?: peerPub
                     
                     val map = mutableMapOf<String, Any>("content" to contentStr)
-                    val mediaId = dm.optString("mediaId").takeIf { it.isNotBlank() }
-                    val mediaType = dm.optString("mediaType").takeIf { it.isNotBlank() }
+                    // Older Hubs sent "mediaId": null, which optString turns into the text "null".
+                    val mediaId = dm.optString("mediaId").takeIf { it.isNotBlank() && it != "null" }
+                    val mediaType = dm.optString("mediaType").takeIf { it.isNotBlank() && it != "null" }
                     if (mediaId != null) {
                         map["media"] = com.noslop.app.mesh.MediaMetadata(
                             id = mediaId,
@@ -553,7 +688,7 @@ class NoSlopRepository(val context: Context, private val db: NoSlopDatabase) {
                         )
                     }
                     val contentToSend = com.noslop.app.util.Json.gson.toJson(map)
-                    val (ciphertext, nonce) = sealHubDm(contentToSend, id, sender, peerPub, peerEncPub, myKeys, timestamp)
+                    val (ciphertext, nonce) = sealHubDm(contentToSend, id, sender, peerPub, peerEncPub, ownKeys, timestamp)
                     
                     if (ciphertext != null && nonce != null) {
                         val localMsg = com.noslop.app.data.ChatMessage(
@@ -569,8 +704,11 @@ class NoSlopRepository(val context: Context, private val db: NoSlopDatabase) {
                         )
                         messageDao.insertMessage(localMsg)
                         
-                        // If WE sent this DM (via Hub Web UI), we must push it back to the Hub so it routes over Tor!
-                        if (sender == myKeys.publicKeyB64) {
+                        // A newer Hub sends Web UI messages itself, from the identity the contact knows
+                        // (sent_by_hub). An older one only stored them: send those from here, as before.
+                        if (dm.optBoolean("sent_by_hub", false)) {
+                            com.noslop.app.debug.Logger.info("HUB_SYNC", "Web UI message $id was sent by the Hub; kept here")
+                        } else {
                             // D05: sealed as v2 by sealHubDm; it used to go out as v1, which a v2 peer refuses.
                             val payloadJson = com.noslop.app.util.Json.gson.toJsonTree(
                                 com.noslop.app.mesh.EncryptedPayload(
@@ -584,31 +722,13 @@ class NoSlopRepository(val context: Context, private val db: NoSlopDatabase) {
                             val packet = com.noslop.app.mesh.NetworkPacket(
                                 id = java.util.UUID.randomUUID().toString(),
                                 hops = 3,
-                                senderId = myKeys.publicKeyB64,
+                                senderId = ownKeys.publicKeyB64,
                                 targetUserId = peerPub,
                                 type = "MESSAGE",
                                 payload = payloadJson
                             )
                             // NOSLOP_HUB_OWNER_API_V1: sent through the Hub to the peer's onion.
                             com.noslop.app.mesh.GossipService.pushPacketToHub?.invoke(peer?.onionAddress?.takeIf { it.isNotBlank() } ?: com.noslop.app.crypto.CryptoService.onionOf(peerPub), packet)
-                        } else {
-                            // If we received this DM from a peer, we must process it locally to update the UI
-                            val payloadJson = com.noslop.app.util.Json.gson.toJsonTree(
-                                com.noslop.app.mesh.EncryptedPayload(
-                                    id = id,
-                                    nonce = nonce,
-                                    ciphertext = ciphertext,
-                                    timestamp = timestamp
-                                )
-                            )
-                            val packet = com.noslop.app.mesh.NetworkPacket(
-                                id = id,
-                                senderId = sender,
-                                targetUserId = myKeys.publicKeyB64,
-                                type = "MESSAGE",
-                                payload = payloadJson
-                            )
-                            handleIncomingPacket(packet)
                         }
                     }
                 }
@@ -714,6 +834,8 @@ class NoSlopRepository(val context: Context, private val db: NoSlopDatabase) {
 
     @Volatile private var lastCreatorContentSync = 0L
     @Volatile private var hubUnreachableRounds = 0
+    /** NOSLOP_HUB_LINK_RESILIENCE_V1: how long the Hub must have been silent before the creator onion comes back here. */
+    private val HUB_TAKEBACK_AFTER_MS = 10 * 60_000L
 
     /**
      * NOSLOP_HUB_CREATOR_HOSTING_V1 — the creator identity on the Home HUB (Hub build only).
@@ -731,8 +853,20 @@ class NoSlopRepository(val context: Context, private val db: NoSlopDatabase) {
         val hostedByHub = appSettingDao.getSetting(HUB_CREATOR_HOSTED_KEY) == "true"
         val status = HubClient.invoke(this@NoSlopRepository, "hub_status")
         if (status == null) {
-            if (hostedByHub && ++hubUnreachableRounds >= 3) {
-                Logger.warn("HUB_SYNC", "Hub unreachable for 3 rounds: publishing the creator onion from this phone again")
+            // NOSLOP_HUB_QR_LOGIN_ROUTE_V1 (2026-11-24): a round only counts against the Hub when this phone's own
+            // Tor was up. With it down (Android stops it while the app is in the background and refuses to restart
+            // it) the Hub is not what is unreachable, and taking the creator onion back would leave two publishers.
+            if (com.noslop.app.tor.TorService.torState.value != com.noslop.app.tor.TorState.READY) {
+                Logger.info("HUB_SYNC", "Hub not reached while this phone's Tor is not ready; not counted against the Hub")
+                return@withContext
+            }
+            // NOSLOP_HUB_LINK_RESILIENCE_V1 (2026-11-25): and only after the Hub has not answered for
+            // HUB_TAKEBACK_AFTER_MS. Three short rounds were enough before: a phone whose own circuits to the Hub
+            // were slow took the creator onion back while the Hub was up and serving it, and then two hosts
+            // published the same onion (contacts reached neither reliably).
+            val silentFor = System.currentTimeMillis() - maxOf(HubClient.lastReachedAt, HubClient.startedAt)
+            if (hostedByHub && ++hubUnreachableRounds >= 3 && silentFor >= HUB_TAKEBACK_AFTER_MS) {
+                Logger.warn("HUB_SYNC", "Hub unreachable for ${silentFor / 60_000} min: publishing the creator onion from this phone again")
                 setHubCreatorHosted(false, burnable)
             }
             return@withContext
@@ -781,7 +915,14 @@ class NoSlopRepository(val context: Context, private val db: NoSlopDatabase) {
             HubClient.invoke(this@NoSlopRepository, "creator_hosting_set", com.google.gson.JsonObject().apply { addProperty("enabled", true) }) ?: return@withContext
         val creatorState = current.get("creator")?.takeIf { it.isJsonObject }?.asJsonObject
         val published = creatorState?.get("onion_published")?.asBoolean == true
-        if (published && !hostedByHub) setHubCreatorHosted(true, burnable)
+        if (published && !hostedByHub) {
+            setHubCreatorHosted(true, burnable)
+            // NOSLOP_HUB_LINK_RESILIENCE_V1: this phone may have published the creator onion meanwhile; its descriptor
+            // is then the newest on the directories and points at this phone. The Hub publishes again so contacts
+            // find the Hub (an older Hub does not know the command; nothing changes there).
+            val again = HubClient.invoke(this@NoSlopRepository, "creator_onion_republish")
+            if (again?.get("republished")?.asBoolean == true) Logger.info("HUB_SYNC", "The Hub published the creator onion again (fresh descriptor)")
+        }
         if (!published) {
             if (hostedByHub) setHubCreatorHosted(false, burnable)
             val err = creatorState?.get("onion_error")?.takeIf { !it.isJsonNull }?.asString
@@ -2914,6 +3055,11 @@ class NoSlopRepository(val context: Context, private val db: NoSlopDatabase) {
 
     suspend fun clearChat(peerPubB64: String) {
         meshSocialRepository.clearChat(peerPubB64)
+        // NOSLOP_DM_CLEAR_STICKS_V1: the Hub's Web UI shows the same conversation; clear it there too (no-op
+        // without a linked Hub; an older Hub answers "unknown command" and keeps it).
+        val before = com.noslop.app.mesh.DmPacketHandler.dmClearedBefore(db, peerPubB64)
+        val res = invokeHubApi("hub_dms_clear", JSONObject().put("peer", peerPubB64).put("before", before))
+        if (res != null) com.noslop.app.debug.Logger.info("HUB_SYNC", "Cleared the chat on the Hub too (${res.optInt("deleted")} messages)")
     }
 
     suspend fun clearGroupChat(groupId: String) {

@@ -2,7 +2,7 @@
 
 **Scope**: This document is a purely technical reference for the NoSlop
 Android application as it exists in the codebase (`com.noslop.app`,
-versionName `0.8.2-alpha`, Room schema version 19 — see §10, compileSdk 37.1,
+versionName `0.8.3-alpha`, Room schema version 19 — see §10, compileSdk 37.1,
 targetSdk 36, minSdk 24). It is intended to complement — not replace — `README.md` and
 `docs/PROJECT_STATUS.md`. Where this document and those files overlap, this
 document goes deeper into implementation detail (file paths, function names,
@@ -1363,13 +1363,13 @@ Database migrations (`MIGRATION_1_2` through `MIGRATION_18_19`) safely preserve 
 | `applicationId` | `com.noslop.app` (`github` flavor) / `com.noslop.me.app` (`play` flavor) |
 | `compileSdk` / `targetSdk` | 37.1 (`release(37) { minorApiLevel = 1 }`, required by `tor-android` 0.4.9.13+) / 36 |
 | `minSdk` | 24 (`app/build.gradle.kts`) — matches [BUILD.md](BUILD.md), which previously stated 26; that doc has been corrected to 24. |
-| `versionCode` / `versionName` | 82 / `0.8.2-alpha` |
+| `versionCode` / `versionName` | 83 / `0.8.3-alpha` |
 | ABIs | `armeabi-v7a, arm64-v8a, x86, x86_64` (`useLegacyPackaging = true` for jniLibs — required by `tor-android`) |
 | Java/Kotlin target | 11 |
 | Compose | enabled, via Compose BOM |
 | Signing | `release` build type reads `NOSLOP_STORE_FILE`/`NOSLOP_STORE_PASSWORD`/`NOSLOP_KEY_ALIAS`/`NOSLOP_KEY_PASSWORD` Gradle properties; `debug` uses the default debug keystore |
 | ProGuard | `release` has `isMinifyEnabled = true`, `isShrinkResources = true` (R8 full mode). Rules in `app/proguard-rules.pro`: `tor-android`; Bouncy Castle **provider packages only** (`org.bouncycastle.jce.provider.**`, `org.bouncycastle.jcajce.provider.**`, `org.bouncycastle.pqc.jcajce.provider.**`, plus `-dontwarn org.bouncycastle.**`; round E5 — the app calls the lightweight API directly, so R8 keeps what it uses, and nothing asks the provider for an algorithm by name); Gson's `TypeToken` rules (E2b; app code uses no `TypeToken`); Room, mesh packets and settings models. Unit tests run the unshrunk debug build, so check a release build with [BUILD.md §8](BUILD.md#8-releasing-an-update) after any rule or dependency change. `ReleaseBuildRulesE5Test` fails if the Bouncy Castle keep-all rule returns. |
-| `GITHUB_PAT` | Read from `local.properties` at build time. Exposed as `BuildConfig.GITHUB_PAT`. When non-blank, enables in-app GitHub issue submission via REST API (`POST /repos/gaborkukucska/NoSlop/issues`). When blank, the Submit button in `ReportIssueScreen` is disabled. |
+| `GITHUB_PAT` | Read from `local.properties` at build time. Exposed as `BuildConfig.GITHUB_PAT`. When non-blank, enables in-app GitHub issue submission via REST API (`POST /repos/DeveLooped-INC/NoSlop/issues`). When blank, the Submit button in `ReportIssueScreen` is disabled. |
 | `GITHUB_ASSIGNEE` | Read from `local.properties` at build time. Exposed as `BuildConfig.GITHUB_ASSIGNEE`. When non-blank, auto-assigns the specified GitHub user to all submitted issues. |
 
 ### Key Dependencies
@@ -1513,7 +1513,7 @@ An architectural audit of the legacy Android app codebase (`app/`) evaluated the
 - **API Metadata vs. Media Stream Bytes**: Cloudflare Worker only proxies API JSON queries. Actual video/audio stream playback bytes (`googlevideo.com`, `jamendo.com`, `v.redd.it`) bypass `yt-proxy` and are fetched directly via `activeMediaClient` (`activeClearnetClient`).
 
 ### 15.2 OTA Update Check & Release Integrity Validation
-- **Source (`NOSLOP_GITHUB_UPDATES_V1`)**: `UpdateChecker` reads `/repos/gaborkukucska/NoSlop/releases/latest` on the GitHub API and nothing else. Only the `github` flavour runs it. The website is not consulted: it runs on a laptop behind a 5G link, and while it listed the APK, the release's file list was never read. Pure rules are in `UpdatePolicy`. Tests: `UpdatePolicyTest`.
+- **Source (`NOSLOP_GITHUB_UPDATES_V1`)**: `UpdateChecker` reads `/repos/DeveLooped-INC/NoSlop/releases/latest` on the GitHub API and nothing else (the public repository since 0.8.3-alpha; 0.8.2-alpha and older read `gaborkukucska/NoSlop`). Only the `github` flavour runs it. The website is not consulted: it runs on a laptop behind a 5G link, and while it listed the APK, the release's file list was never read. Pure rules are in `UpdatePolicy`. Tests: `UpdatePolicyTest`.
 - **Rate limits**: unauthenticated API calls are limited per IP, which an exit shares with everyone on it. Each call therefore gets up to three tries (`GITHUB_ATTEMPTS`), each on its own isolated circuit, and a check runs at most once an hour (`MIN_CHECK_INTERVAL_MS`) unless a known update still has no checksum.
 - **Fresh release and checksum on every download (`NOSLOP_FRESH_CHECKSUM_V1`)**: `UpdateManager.startDownload(context, info, destination)` ignores the `UpdateInfo` it is handed. It forces a new check (`checkForUpdate(force = true)`) and uses only the APK link and checksum that check returns. If the release or its checksum can't be read, the download is cancelled and the empty destination file is removed. A release replaced after the app read it, or a stale cached checksum, can't pair a good APK with the wrong digest. The release call, the checksum call and the APK download all send `CacheControl.FORCE_NETWORK`.
 - **Save-as picker (`NOSLOP_SAVE_AS_PICKER_V1`, `ui/components/UpdateStarter.kt`)**: on Android 10+ the Start Update, Download Update and Download Again buttons call `rememberUpdateStarter()`, which opens the system `CreateDocument` picker and starts the download once a place is chosen. NoSlop writes bytes into the file the system created (`saveToDownloads(..., destination)`). Cancelling the picker cancels the update. **Why:** a file NoSlop creates itself through MediaStore is recorded as NoSlop's. NoSlop has no `REQUEST_INSTALL_PACKAGES` on purpose, so the system installer refused to open that APK from the Files app, silently. Moving or renaming it in Files made it open. Android 9 and older keep the app-folder path and start straight away.
@@ -3060,6 +3060,7 @@ Built 2026-11-22 (Hub build only, `NOSLOP_ENABLE_HUB=true`), together with HAI-N
 * **The Hub's onion is checked** against our key before `updateOnionAddress` (the other gap noted in §1.1's
   status entry).
 * Admin AI DMs: the Hub opens the owner's v2 message, returns a `DM_ACK` v3 at once and the reply as v2.
+* **Web UI login by QR** (`NOSLOP_HUB_QR_LOGIN_ROUTE_V1`, 2026-11-24): `handleQrLogin` posts the signed session id through `HubClient.postUnsigned`, so it takes the same routes as every other Hub call: the LAN address where the network security config allows cleartext (it does not by default, `NOSLOP_TLS_TRUST_V1`), the address in the QR code when it is an onion or an allowed LAN host, then the Hub's onion over Tor. Before, it only tried plain HTTP to the LAN address, which Android refuses ("Cleartext HTTP traffic to … not permitted"), so QR login never worked against a LAN Hub. The Hub checks the signature against its owner key and keeps the browser's login session in memory, whichever address it was reached on. Second step the same day: the login waits (up to 90 s, showing "Connecting to Tor network...") when this phone's Tor is not READY, gives onion routes 60 s to connect instead of 20 s, and tries once more if the first, cold connection gets no answer. `ensureCreatorHostedOnHub` no longer counts a round in which this phone's own Tor was down as "Hub unreachable": in the 2026-11-24 test Android stopped the phone's Tor in the background and the phone took the creator onion back from a Hub that was fine.
 
 Tests: `HubClientSignatureTest` (the signature is pinned to the Hub's own test vector, HAI-Net
 `hainet-noslop/tests/vectors.rs`), `OnionAddressUpdateTest` (hook signature).
@@ -3101,6 +3102,142 @@ auto-accepts followers as the phone does; it serves **only** the creator's own p
   so `hainet-core` can publish the creator onion.
 * **Not covered:** discoverable without creator mode is not handed over; non-creator community mirroring
   and the discovery cache (Enhancement Plan) are not started; no Hub page status line yet (logs: `HUB_SYNC`).
+
+### 16.60 The Tor service is bound, not only started (`NOSLOP_TOR_BOUND_SERVICE_V1`)
+
+Built 2026-11-24, after two crashes in a Hub-mode device test.
+
+* **The crash.** NoSlop started tor-android's `TorService` with `startService` only. With a Hub linked NoSlop
+  runs no foreground service (the Hub is the always-on part), so about a minute after the app left the screen
+  Android stopped the service for app idleness ("Stopping service due to app idle: …
+  org.torproject.jni.TorService", 14:17:27.903) and 13 ms later libtor aborted the whole app ("FORTIFY:
+  pthread_mutex_lock called on a destroyed mutex", in `tor_cond_wait`). `TorService.onDestroy` asks Tor to shut
+  down; when Tor's thread finishes it frees its configuration (`mainConfigurationFree`) while worker threads may
+  still be waiting on its locks. At 13:22 the same stop had left Tor off without crashing: it is a race.
+* **First attempt, withdrawn the same day.** Halting Tor cleanly ourselves 30 s after the app went to the
+  background (`SIGNAL HALT`, then `stopTor`) crashed the same way at 14:38:49, 3 s after the halt: any shutdown of
+  Tor inside the app's process can abort it.
+* **Now.** `startTor` also binds to the Tor service with `BIND_AUTO_CREATE` once it is started, as tor-android's
+  Javadoc asks. A service with such a binding is not destroyed by Android's idle stop, so Tor is never torn down
+  when the app goes to the background: the cached app is frozen (Android 14+: no CPU, so no battery cost) or, when
+  memory is needed, killed outright, which shows no crash dialog. When the app is opened it thaws and Tor carries
+  on (or, after a kill, starts as on any launch). `stopTor` (explicit Tor restart in Settings, a backup restore)
+  unbinds before stopping the service; those deliberate stops still shut Tor down in-process, as before. A start after Tor's thread ended by itself (FAILED) first releases the old binding, because tor-android's `stopSelf()` cannot destroy a bound service and Tor only starts in the service's `onCreate`.
+* Owner decision 2026-11-24 for Hub mode: no foreground service and no notification for this; the Hub keeps the
+  creator identity and collects packets for the phone meanwhile.
+
+### 16.61 DMs mirrored to the Hub's Web UI decrypt with the creator keys too (`NOSLOP_HUB_DM_MIRROR_KEYS_V1`)
+
+Found 2026-11-24 (device test: DMs between two phones worked both ways, but the Hub's Web UI showed `...` for every
+message). `syncDmsWithHub` decrypts the last 30 messages per contact to mirror them to the Hub (`sync_push_dms`), but
+tried only the personal keys and sent `"..."` as the text when that failed. DMs with a contact who knows us as a
+creator are encrypted to the creator identity, so all of those arrived as `...`. It now decrypts as
+`ChatThreadScreen` does (personal keys, then the creator keys; the contact's Ed25519 key when it has no X25519 key)
+and never mirrors a message it cannot decrypt (logged as a count). The Hub replaces the stored `...` rows when the
+same message ids are pushed again (`INSERT OR REPLACE`).
+
+### 16.62 DMs typed in the Hub's Web UI (`NOSLOP_HUB_WEBUI_SEND_V1`)
+
+Found 2026-11-24 (device test): a DM typed in the Hub's Web UI to a contact who follows us as a creator never
+arrived ("Dropping DM from MCowBQYDK2Vw: no X25519 key on record") and showed on this phone with an attachment that
+never downloaded ("MEDIA_REQUEST for null").
+
+* The Web UI only stored the text; `syncPullIncrementalDMsFromHub` later sent it from the **personal** identity,
+  which a creator follower does not know. The Hub now sends it itself (HAI-Net `hub::dms::send_from_web_ui`), DM v2
+  from the identity the contact knows (`hub_contacts_push`'s `identity`), and lists it with `sent_by_hub: true`.
+  This phone keeps a copy (sealed with the keys of the identity that wrote it, the creator keys for a creator
+  message) and does not send it again; a message from an older Hub (no flag) is sent from here as before, from the
+  identity named as its sender.
+* The Hub returned `"mediaId": null` for a text message and `optString` turned it into `"null"`: a phantom
+  attachment. Both pulls now ignore `"null"` (and the Hub sends `""`).
+* Only our own messages are taken from `sync_pull_dms` now. Since the Hub opens DMs for its Web UI
+  (`NOSLOP_HUB_DM_VIEW_V1`) that list also holds contacts' DMs, which reach this phone through the Hub inbox,
+  signature-checked. The one-time restore (`syncPullHistoricalDataFromHub`) still takes everything.
+
+### 16.63 A Hub deployment keeps the app in the foreground (`NOSLOP_HUB_DEPLOY_KEEPALIVE_V1`)
+
+Found 2026-11-25: "Update Hub Software" failed ("Deployment failed (exit code -1)" while compiling `hainet-core`)
+when the user switched to another app during the update, and succeeded with the app kept on screen. The
+deployment runs over this app's SSH session and the build on the Hub runs inside it; once the app left the screen
+nothing kept the process in the foreground (with a Hub linked the foreground service is off), Android froze it, the
+session dropped and the Hub stopped the build. `SshDeployer.deployHaiNetHub` now starts `NoSlopForegroundService`
+for the whole deployment (`startKeepAlive`; its notification and partial wake lock) and stops it afterwards
+(`stopKeepAlive`). It leaves the service alone when the user already runs it, and a service that only kept a
+deployment alive does not broadcast `USER_EXIT` when it stops; a normal `start` (the user's setting) during a
+deployment turns it back into the user's service. Not covered: a deployment interrupted by the network itself
+(the build still runs inside the SSH session).
+
+### 16.64 Hub deployments run detached and survive a dropped connection (`NOSLOP_HUB_DEPLOY_DETACHED_V1`)
+
+Found 2026-11-25, two "Update Hub Software" attempts in a row: the first failed with "exit code -1" a few seconds
+into compiling `hainet-core` (the SSH channel closed without an exit status), although the build carried on on the
+Hub; the second waited for the first build ("Blocking waiting for file lock"), built, then failed with "sudo: A
+terminal is required to authenticate": when the first run ended, its cleanup deleted the sudo helpers both runs kept
+at the same fixed paths (`~/.hainet_askpass`, `~/.hainet_deploy_tmp/sudo`).
+
+* `SshDeployer` uploads the script over the channel's stdin into an owner-only run folder
+  (`~/.hainet_deploy_runs/<id>/deploy.sh`, mode 0600 in 0700; no secret on any command line), starts it detached
+  (`setsid nohup`, log in the run folder) and follows the log (`tail --pid -f`). The script deletes its own file
+  as it starts. If the connection drops, the app reconnects (the pinned host key is checked again; up to 20
+  failed attempts in a row, any progress resets the count) and continues from the last byte it received. The
+  result is the script's exit code, written by the runner; exit 99 (existing deployment) works as before. If the
+  Hub cannot be reached again, the app says the deployment keeps running there.
+* One deployment at a time: the runner holds `flock` on `~/.hainet_deploy.lock`. A new deployment that finds an
+  earlier one still running follows that one to its end first, then starts.
+* Each run keeps its sudo helpers in its own folder (`$NOSLOP_RUN_DIR`), removed by its exit trap; run folders
+  older than two days and uploaded scripts that never started within ten minutes are removed.
+* §16.63 (the foreground service during a deployment) still applies: it keeps the app's side running.
+
+Tests: `SshDeployerDetachedTest` (the UTF-8 split of a streamed log, and that no command line carries a secret).
+
+### 16.65 DM deletes are applied, and a cleared chat stays cleared (`NOSLOP_DM_DELETE_SIGNATURE_V1`, `NOSLOP_DM_CLEAR_STICKS_V1`)
+
+Found 2026-11-25 (device test): a message Gabby deleted stayed on this phone, and "Clear Chat" on this phone came
+back a minute later, everywhere (phone and the Hub's Web UI).
+
+* **No DM delete was ever applied by the receiver.** Senders (`deleteDirectMessage`, `clearChat`) sign
+  `encodeForSigning(messageId, authorId, timestamp)`, which `MeshPacketVerifier` checks; `handleDeleteMessage` then
+  re-checked the older `messageId|authorId|timestamp` text, which never verified, and returned false. It now accepts
+  either form (WIRE_PROTOCOL_REFERENCE lists the pipe form; both are signed by the author's key).
+* **A cleared chat refilled itself.** After a clear the conversation is empty, so the next `requestDmSync` asked the
+  contact for everything `since=0`, and the contact (who never applied the deletes, above) sent it all back.
+  `clearChat` now stores `dm_cleared_before_<peer>`; `requestDmSync` asks from that time at the earliest, and
+  `handleDirectMessage` acknowledges but does not store a one-to-one DM written before it (so a sender re-sending an
+  unacknowledged DM stops).
+* **The Hub's copy.** `clearChat` also calls `hub_dms_clear {peer, before}`: the Hub removes that conversation from
+  its Web UI and its notifications, and ignores older copies afterwards (HAI-Net `NOSLOP_HUB_DM_DELETE_V1`, which
+  also applies `DELETE_MESSAGE`s to the Web UI's chat).
+* Not changed: group chats (`clearGroupChat`) and what the contact keeps of their own messages.
+
+### 16.66 The Hub link after a long background, DM attachments on the Hub, chat refresh and Tor status (`NOSLOP_HUB_LINK_RESILIENCE_V1`, `NOSLOP_HUB_DM_MEDIA_V1`, `NOSLOP_CHAT_REFRESH_V1`, `NOSLOP_CHAT_TOR_STATUS_V1`)
+
+Found 2026-11-25 (device test, logs of both phones and the Hub): after the app had been in the background, nothing
+reached the phone from the Hub for half an hour, and attachments showed in the Hub's Web UI chat only as "open this
+conversation on your phone".
+
+* **Split creator onion.** The phone's signed Hub calls gave up on the Hub's onion after 20 s, so with slow circuits
+  three background rounds failed within minutes and the phone published the creator onion itself, while the Hub,
+  which was up, kept publishing it too. When the phone handed it back, its descriptor was still the newest on the
+  directories, so contacts kept reaching the (frozen) phone: Gabby's "SOCKS: Host unreachable" to the creator onion
+  until the Hub restarted. Now the onion connection gets 45 s; the creator onion comes back to the phone only after
+  three failed rounds *and* 10 minutes without any answer from the Hub (counted from the app's start at the
+  earliest); and on hand-back the phone asks the Hub to publish again (`creator_onion_republish`, a fresh
+  descriptor). An older Hub does not know the command; nothing else changes there.
+* **One failure, not one per call.** After a failed connection to the Hub's onion, the other calls of the same
+  background round skip it for 15 s instead of each waiting out its own timeout, and Tor is asked for the Hub's
+  current descriptor (`HSFETCH`, at most every 2 minutes). A refresh by the user clears the gap.
+* **DM attachments on the Hub.** Every mirrored DM with an attachment (not a picker GIF) is noted; at most once a
+  minute the phone asks the Hub which it lacks (`hub_dm_media_info`) and uploads the ones it holds (its own, and
+  those it downloaded), as resumable 512 KB chunks (`dm_media_put`, owner-signed), 32 MB per round. The Hub fetches
+  a contact's attachments itself from the contact (HAI-Net `NOSLOP_HUB_DM_MEDIA_V1`); the Web UI shows images and
+  GIFs, plays audio, voice recordings and video, and offers other files for download.
+* **Refresh button in the chat** (`NoSlopViewModel.refreshChat`): starts Tor again when it stopped or failed, pulls
+  the Hub's inbox and Web UI messages right away, sends this contact's outbox and asks them for missed DMs; a
+  spinner shows while it works (two minutes at most).
+* **Tor status in the chat:** while Tor is not ready (after 3 s) a line above the messages says "Connecting to Tor
+  network..."; when Tor stopped or failed, it says so with Retry. Existing translated strings, plus "Refresh chat"
+  in all 21 languages.
+* Not changed: packets, Room schema, the Hub's own `MEDIA_REQUEST` handling for the creator's public media.
 
 ## 17. Audit and Hardening Pass (2026-09-02)
 
@@ -3567,7 +3704,7 @@ A comprehensive audit of the legacy Android application codebase (`app/`) addres
 
 1. **R8-Safe Outbox Deserialization (`MeshSocialRepository.kt`)**: In release builds, `loadPersistedOutbox()` threw `RuntimeException: TypeToken must be created with a type argument: new TypeToken<...>() {}` due to R8 minification stripping anonymous generic type tokens. Replaced `TypeToken` with direct `JsonParser.parseString(json).asJsonObject` iteration into `NetworkPacket` instances, eliminating outbox restore crashes on startup.
 2. **Image URL Clean Formatting (`MediaComponents.kt`)**: `sanitizeImageUrl()` previously called `Html.fromHtml(cleanUrl, ...).toString()`, which automatically appends `\n\n`. The trailing newlines were never stripped, causing OkHttp and Coil to reject all sanitized image URLs with `IllegalArgumentException`. Added `.trim()` and safe entity decoding.
-3. **Wikimedia & Art Institute Image Headers (`MediaComponents.kt`, `NoSlopApp.kt`)**: Wikimedia Commons blocks generic browser User-Agents from Tor exit nodes with HTTP 403 Forbidden under its robot policy. Injected `NoSlop-Android/1.0 (https://github.com/gaborkukucska/NoSlop)` for `wikimedia.org` / `wikipedia.org`, and `AIC-User-Agent` for `artic.edu` across `BlurredImageBackground`, `ZoomableImageDialog`, and the app-wide Coil interceptor.
+3. **Wikimedia & Art Institute Image Headers (`MediaComponents.kt`, `NoSlopApp.kt`)**: Wikimedia Commons blocks generic browser User-Agents from Tor exit nodes with HTTP 403 Forbidden under its robot policy. Injected `NoSlop-Android/1.0 (https://github.com/DeveLooped-INC/NoSlop)` for `wikimedia.org` / `wikipedia.org`, and `AIC-User-Agent` for `artic.edu` across `BlurredImageBackground`, `ZoomableImageDialog`, and the app-wide Coil interceptor.
 4. **Undated Feed Interleaving (`NoSlopViewModel.kt`)**: Filter modes for `Audio` and `Images` previously sorted feeds strictly by `publishedAt DESC`. Because Openverse, Wikimedia, and Art Institute use the undated sentinel `publishedAt = 0L`, they were pushed to the bottom beneath thousands of dated items. Sorted using `effectiveDate` (`now - 20 days` assumed age) so undated media items interleave with dated items.
 5. **Jamendo Client ID Candidate Pool (`JamendoApiClient.kt`)**: Replaced suspended client ID `709fa152` with a rotating pool of candidate client IDs. On error code 11 or 4, the client advances `candidateIndex` and retries with the next candidate.
 

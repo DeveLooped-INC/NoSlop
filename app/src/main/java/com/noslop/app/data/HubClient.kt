@@ -46,6 +46,41 @@ object HubClient {
     /** Whether the last request reached the Hub (for the Hub page). */
     @Volatile var lastReachedAt: Long = 0L
 
+    // NOSLOP_HUB_LINK_RESILIENCE_V1 (2026-11-25): the background sync loop runs every 5 s and makes several Hub
+    // calls in a row. While the Hub's onion cannot be reached each of them waited out its own connect timeout, so
+    // one round took minutes and a reachable Hub was tried again only after all of them. Now, after a failed onion
+    // connection, the next calls skip the onion for [ONION_RETRY_GAP_MS] (the next round tries again), the
+    // connection gets [ONION_CONNECT_TIMEOUT_S] (a rendezvous with a cold circuit often takes 20-40 s on a phone),
+    // and Tor is asked for the Hub's current descriptor (at most every [DESCRIPTOR_REFRESH_GAP_MS]), so a Hub whose
+    // Tor restarted is found at its new introduction points. A refresh the user asks for clears the gap.
+    @Volatile private var onionFailedAt: Long = 0L
+    @Volatile private var descriptorRefreshedAt: Long = 0L
+    private const val ONION_RETRY_GAP_MS = 15_000L
+    private const val ONION_CONNECT_TIMEOUT_S = 45L
+    private const val DESCRIPTOR_REFRESH_GAP_MS = 120_000L
+
+    /** When this process started (the Hub counts as silent only from then on). */
+    val startedAt: Long = System.currentTimeMillis()
+
+    /** The user asked for a refresh: try the Hub's onion at once. */
+    fun clearOnionBackoff() { onionFailedAt = 0L }
+
+    private fun onionInBackoff(now: Long = System.currentTimeMillis()): Boolean =
+        onionFailedAt > lastReachedAt && now - onionFailedAt < ONION_RETRY_GAP_MS
+
+    private fun noteOnionFailure(baseUrl: String) {
+        val now = System.currentTimeMillis()
+        onionFailedAt = now
+        if (now - descriptorRefreshedAt < DESCRIPTOR_REFRESH_GAP_MS) return
+        descriptorRefreshedAt = now
+        val host = baseUrl.removePrefix("http://").substringBefore(':')
+        try {
+            com.noslop.app.tor.TorService.refreshOnionDescriptor(host)
+        } catch (e: Exception) {
+            Logger.debug(TAG, "Descriptor refresh for the Hub not started: ${e.message}")
+        }
+    }
+
     private fun sha256Hex(bytes: ByteArray): String =
         MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 
@@ -85,8 +120,9 @@ object HubClient {
         }
         val onion = repo.getLocalIdentity()?.onionAddress
         if (!onion.isNullOrBlank()) {
-            val tor = if (longTransfer) HttpClientProvider.torClient.newBuilder()
-                .readTimeout(600, TimeUnit.SECONDS).writeTimeout(600, TimeUnit.SECONDS).build() else HttpClientProvider.torClient
+            val tor = if (longTransfer) HttpClientProvider.torClient.newBuilder().connectTimeout(ONION_CONNECT_TIMEOUT_S, TimeUnit.SECONDS)
+                .readTimeout(600, TimeUnit.SECONDS).writeTimeout(600, TimeUnit.SECONDS).build()
+            else HttpClientProvider.torClient.newBuilder().connectTimeout(ONION_CONNECT_TIMEOUT_S, TimeUnit.SECONDS).build()
             out.add(Route("http://$onion:8080", tor))
         }
         return out
@@ -118,6 +154,11 @@ object HubClient {
     ): T? = withContext(Dispatchers.IO) {
         val keys = repo.getLocalIdentity() ?: return@withContext null
         for (route in routes(repo, longTransfer)) {
+            val isOnion = route.baseUrl.endsWith(".onion:8080")
+            if (isOnion && onionInBackoff()) {
+                Logger.debug(TAG, "$method $path: the Hub's onion failed moments ago; skipped this time")
+                continue
+            }
             try {
                 val builder = Request.Builder().url(route.baseUrl + path)
                 // A fresh signature per attempt: the nonce must never be reused.
@@ -134,9 +175,54 @@ object HubClient {
                 }
             } catch (e: Exception) {
                 Logger.warn(TAG, "$method $path via ${route.baseUrl.take(24)} failed: ${e.message}")
+                if (isOnion && e is java.io.IOException) noteOnionFailure(route.baseUrl)
             }
         }
         null
+    }
+
+    /** A reply from the Hub: the HTTP status and the body text. */
+    data class Reply(val code: Int, val body: String)
+
+    /**
+     * NOSLOP_HUB_QR_LOGIN_ROUTE_V1 — an unsigned POST to one of the Hub's login routes (`/api/auth/...`),
+     * which check their own signature inside the body. Same routes as [request]: the LAN address where
+     * the network security config allows cleartext, else the Hub's onion over Tor. [scannedHost], the
+     * address a QR code named, is tried after the LAN address when it is an onion or an allowed LAN host.
+     * The first route that answers at all gives the reply; null when none did.
+     */
+    suspend fun postUnsigned(repo: NoSlopRepository, path: String, body: ByteArray, scannedHost: String? = null): Reply? = withContext(Dispatchers.IO) {
+        val base = routes(repo, longTransfer = false)
+        val scanned = scannedHost?.trim()?.lowercase()?.takeIf { it.isNotBlank() }?.let { scannedRoute(it) }
+            ?.takeIf { s -> base.none { it.baseUrl == s.baseUrl } }
+        // The first connection to an onion after Tor (re)starts can take well over the usual 20 s, and someone is
+        // waiting at the browser: onion routes get 60 s to connect here.
+        val ordered = (base.filterNot { it.baseUrl.endsWith(".onion:8080") } + listOfNotNull(scanned) +
+            base.filter { it.baseUrl.endsWith(".onion:8080") }).map { r ->
+            if (r.baseUrl.endsWith(".onion:8080")) r.copy(client = r.client.newBuilder().connectTimeout(60, TimeUnit.SECONDS).build()) else r
+        }
+        for (route in ordered) {
+            try {
+                val req = Request.Builder().url(route.baseUrl + path).post(body.toRequestBody(JSON)).build()
+                route.client.newCall(req).execute().use { r ->
+                    val text = r.body?.string().orEmpty()
+                    if (r.isSuccessful) lastReachedAt = System.currentTimeMillis()
+                    return@withContext Reply(r.code, text)
+                }
+            } catch (e: Exception) {
+                Logger.warn(TAG, "POST $path via ${route.baseUrl.take(24)} failed: ${e.message}")
+            }
+        }
+        null
+    }
+
+    private fun scannedRoute(host: String): Route? = when {
+        host.endsWith(".onion") -> Route("http://$host:8080", HttpClientProvider.torClient)
+        NoSlopRepository.isPrivateLanAddress(host) && try {
+            android.security.NetworkSecurityPolicy.getInstance().isCleartextTrafficPermitted(host)
+        } catch (_: Throwable) { false } -> Route("http://$host:8080", HttpClientProvider.rawClearnetClient.newBuilder()
+            .connectTimeout(3, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS).writeTimeout(30, TimeUnit.SECONDS).build())
+        else -> null
     }
 
     /** `/api/invoke` with a Gson body; the reply as a Gson object. */
